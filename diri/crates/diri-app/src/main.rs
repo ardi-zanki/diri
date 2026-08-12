@@ -18,6 +18,7 @@ mod inspector;
 mod launcher;
 pub mod markdown;
 mod markdown_view;
+mod menu_inbox;
 pub mod navigation;
 pub mod notifications;
 pub mod palette;

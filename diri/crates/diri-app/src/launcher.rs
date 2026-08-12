@@ -185,6 +185,11 @@ impl LauncherOverlay {
         cx.notify();
     }
 
+    /// Close from outside the launcher (sidebar session click, menu bar, etc.).
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.close(cx);
+    }
+
     fn harness_choices(&self) -> Vec<AgentOption> {
         let store = self
             .services

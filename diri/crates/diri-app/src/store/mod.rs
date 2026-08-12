@@ -320,7 +320,13 @@ pub struct SessionStore {
     auto_resume_attempted: HashSet<SessionId>,
     revision: u64,
     cached_projection: Option<(u64, Arc<SidebarProjection>)>,
+    /// The same tree with sidebar folds blanked; see [`SessionStore::menu_bar_projection`].
+    cached_menu_projection: Option<(u64, Arc<SidebarProjection>)>,
     prefs_path: Option<PathBuf>,
+    /// Set by the menu bar's New Agent action; drained by Root on UI sync.
+    pending_open_launcher: bool,
+    /// Set by the menu bar's Settings action; drained by Root on UI sync.
+    pending_open_settings: bool,
     /// Remote host catalog from hosts.json. Empty when the file is absent or
     /// invalid (pickers show Local only). Reloaded on picker open.
     hosts: Vec<HostEntry>,
@@ -393,7 +399,10 @@ impl SessionStore {
                 auto_resume_attempted: HashSet::new(),
                 revision: 0,
                 cached_projection: None,
+                cached_menu_projection: None,
                 prefs_path,
+                pending_open_launcher: false,
+                pending_open_settings: false,
                 hosts: Vec::new(),
                 agents: HashMap::new(),
                 agent_catalog_scans: HashMap::new(),
@@ -1074,6 +1083,32 @@ impl SessionStore {
         projection
     }
 
+    /// Same tree as the sidebar, but ignoring sidebar fold prefs so the menu
+    /// bar can keep its own independent project collapse state.
+    ///
+    /// Revision-cached like [`Self::sidebar_projection`]: the panel refreshes on
+    /// every publish while it is open, and rebuilding the tree (plus cloning
+    /// `Prefs` to blank the folds) each time is the expensive half of that work.
+    pub fn menu_bar_projection(&mut self) -> Arc<SidebarProjection> {
+        if let Some((revision, projection)) = &self.cached_menu_projection
+            && *revision == self.revision
+        {
+            return Arc::clone(projection);
+        }
+        let mut prefs = self.prefs.clone();
+        prefs.sidebar_collapsed_projects.clear();
+        prefs.sidebar_collapsed_sessions.clear();
+        let projection = Arc::new(projection::build_projection(
+            &self.sessions,
+            &self.projects,
+            &prefs,
+            self.selected_session_id.as_ref(),
+            &self.closing,
+        ));
+        self.cached_menu_projection = Some((self.revision, Arc::clone(&projection)));
+        projection
+    }
+
     pub fn ordered_sessions(&mut self) -> Vec<SessionRecord> {
         self.sidebar_projection()
             .ordered_sessions
@@ -1634,6 +1669,9 @@ impl SessionStore {
         self.apply_overview_outcome(outcome);
     }
 
+    /// The highest attention across every session. Cheap enough to run on every
+    /// publish, which is what a closed menu-bar panel refreshes from instead of
+    /// paying for a full sidebar projection.
     pub fn global_attention(&self) -> AttentionLevel {
         self.sessions
             .values()
@@ -1841,6 +1879,34 @@ impl SessionStore {
             id,
             automatic: false,
         });
+    }
+
+    /// Menu bar can ask for the launcher while another app still owns focus.
+    /// `PublishSnapshot` already forces a publish on its own, so this never
+    /// claims `app_is_active` — that flag gates banner suppression, and lying
+    /// about it would silence notifications for a still-background app.
+    pub fn request_open_launcher(&mut self) {
+        self.pending_open_launcher = true;
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn take_open_launcher_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_launcher)
+    }
+
+    pub fn request_open_settings(&mut self) {
+        self.pending_open_settings = true;
+        self.emit(StoreEffect::PublishSnapshot);
+    }
+
+    pub fn take_open_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_open_settings)
+    }
+
+    /// Cheap read-lock probe so the UI sync loop only takes a write lock on the
+    /// rare tick that actually has a menu-bar request to drain.
+    pub fn has_pending_ui_request(&self) -> bool {
+        self.pending_open_launcher || self.pending_open_settings
     }
 
     pub fn rename(&mut self, id: SessionId, title: impl Into<String>) {
@@ -2175,6 +2241,7 @@ impl SessionStore {
     fn invalidate_projection(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.cached_projection = None;
+        self.cached_menu_projection = None;
     }
 
     fn emit(&self, effect: StoreEffect) {

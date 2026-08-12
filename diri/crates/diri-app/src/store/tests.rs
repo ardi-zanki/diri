@@ -708,8 +708,22 @@ fn spawn_response_focuses_session_when_event_arrives_first() {
     assert!(store.terminal_residency().contains(&id("spawned")));
 }
 
+/// The menu-bar status item tints from this, so an archived blocker still
+/// colours the glyph even though its row is not in the list. Documented rather
+/// than fixed: the rollup carries one level, and dropping archived sessions
+/// here would also drop a live `DoneUnseen` sitting behind one.
 #[test]
-fn attention_rollup_and_needs_input_sort_use_proto_derivation() {
+fn global_attention_ranks_across_archived_sessions_too() {
+    let mut shelved = session("shelved", "p", 1.0);
+    shelved.status = SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+    shelved.archived_at = Some(DateMillis(10.0));
+    let (store, _) = hydrated(vec![shelved], vec![project("p", "P")], Prefs::default());
+
+    assert_eq!(store.global_attention(), AttentionLevel::NeedsInput);
+}
+
+#[test]
+fn attention_and_needs_input_sort_use_proto_derivation() {
     let mut done = session("done", "p", 1.0);
     done.last_turn_completed_at = Some(DateMillis(50.0));
     done.last_seen_at = Some(DateMillis(40.0));
@@ -1963,4 +1977,39 @@ fn action_retry_policy_only_replays_idempotent_operations() {
             "unsafe operation unexpectedly became replayable: {unsafe_effect:?}"
         );
     }
+}
+
+/// The menu bar refreshes on every publish while its panel is open, so this
+/// projection has to be cached the way the sidebar's is — rebuilding the tree
+/// and cloning `Prefs` per publish measured ~28µs against ~8ns cached at 80
+/// sessions. Pointer equality is the only way to see the cache from a test.
+#[test]
+fn the_menu_bar_projection_is_cached_per_revision() {
+    let (mut store, _) = hydrated(
+        vec![session("one", "p", 1.0), session("two", "p", 2.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    // Collapse after hydration: hydrating selects a session, and selecting
+    // unfolds whatever hides it (`selecting_a_folded_session_reveals_it`).
+    store
+        .toggle_project_collapsed(pid("p"))
+        .expect("collapse the project");
+
+    let first = store.menu_bar_projection();
+    assert!(
+        Arc::ptr_eq(&first, &store.menu_bar_projection()),
+        "a second call at the same revision must reuse the built tree"
+    );
+
+    // The menu bar keeps its own collapse state, so it ignores the sidebar's
+    // folds; that difference is why it cannot just share `sidebar_projection`.
+    assert_eq!(rows(&first, 0), vec![id("one"), id("two")]);
+    assert!(store.sidebar_projection().projects[0].sessions.is_empty());
+
+    store.rename(id("one"), "renamed");
+    assert!(
+        !Arc::ptr_eq(&first, &store.menu_bar_projection()),
+        "a mutation must invalidate the cache, not serve a stale tree"
+    );
 }

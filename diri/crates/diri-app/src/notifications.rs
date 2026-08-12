@@ -271,6 +271,25 @@ pub fn command_for_action(action_id: &str, data: &ActionData) -> Option<SendText
     })
 }
 
+/// Quick Approve/Deny payload for a permission prompt — shared by notifications
+/// and the menu-bar attention inbox.
+#[must_use]
+pub fn permission_action_data(
+    session: &SessionRecord,
+    descriptor: Option<&AgentDescriptor>,
+) -> Option<ActionData> {
+    session
+        .needs_input
+        .as_ref()
+        .filter(|detail| detail.kind == NeedsInputKind::Permission)
+        .and_then(|_| approve_answer(session.effective_kind(), descriptor))
+        .map(|approve| ActionData {
+            session_id: session.id.clone(),
+            approve,
+            deny: deny_answer(descriptor),
+        })
+}
+
 /// Produce the sound/banner work that a session update earns immediately.
 ///
 /// These are one-shot facts — the host cannot keep processes alive, the
@@ -436,14 +455,7 @@ fn attention_request(
     let (title, body, suffix, action_data) = match session.attention() {
         AttentionLevel::NeedsInput => {
             let detail = session.needs_input.as_ref();
-            let action_data = detail
-                .filter(|detail| detail.kind == NeedsInputKind::Permission)
-                .and_then(|_| approve_answer(session.effective_kind(), descriptor))
-                .map(|approve| ActionData {
-                    session_id: session.id.clone(),
-                    approve,
-                    deny: deny_answer(descriptor),
-                });
+            let action_data = permission_action_data(session, descriptor);
             (
                 format!(
                     "{} needs you",
