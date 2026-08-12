@@ -629,12 +629,25 @@ mod tests {
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.join("source");
         git(temp, &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        // `prepare` invokes git in a separate shell and must not inherit a
+        // developer machine's global identity. Give every fixture checkout
+        // its own author, just as a real configured checkout has one.
+        git(&source, &["config", "user.name", "Diri Test"]);
+        git(
+            &source,
+            &["config", "user.email", "diri-test@example.invalid"],
+        );
         std::fs::write(source.join("file.txt"), "v1\n").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.join("target");
         git(temp, &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(&target, &["config", "user.name", "Diri Test"]);
+        git(
+            &target,
+            &["config", "user.email", "diri-test@example.invalid"],
+        );
         (source, target)
     }
 

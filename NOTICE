@@ -25,6 +25,7 @@ herdr's TOML screen manifests (`src/detect/manifests/*.toml`):
 
     diri/crates/diri-engine/manifests/amp.json
     diri/crates/diri-engine/manifests/antigravity.json
+    diri/crates/diri-engine/manifests/cline.json
     diri/crates/diri-engine/manifests/copilot.json
     diri/crates/diri-engine/manifests/devin.json
     diri/crates/diri-engine/manifests/droid.json
@@ -33,6 +34,7 @@ herdr's TOML screen manifests (`src/detect/manifests/*.toml`):
     diri/crates/diri-engine/manifests/kilo.json
     diri/crates/diri-engine/manifests/kimi.json
     diri/crates/diri-engine/manifests/kiro.json
+    diri/crates/diri-engine/manifests/maki.json
     diri/crates/diri-engine/manifests/opencode.json
     diri/crates/diri-engine/manifests/pi.json
     diri/crates/diri-engine/manifests/qoder.json

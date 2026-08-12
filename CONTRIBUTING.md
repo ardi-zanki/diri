@@ -75,7 +75,9 @@ This is the easiest place to start and needs no Rust. Agent support is data:
 each agent is one JSON file in `diri/crates/diri-engine/manifests/`
 describing how to spawn it, how to resume a session, which keystrokes approve or
 deny, and the screen predicates that decide whether it is working, waiting on
-you, or done. Copy the closest existing manifest and adjust it.
+you, or done. Copy the closest existing manifest and adjust it. The
+[manifest-authoring guide](docs/AGENT-MANIFESTS.md) covers the schema,
+real-screen capture workflow, examples, overrides, and focused validation.
 
 Claude Code and Codex have first-class status detection and resume. Anything
 without a manifest still runs as a plain terminal.

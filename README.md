@@ -78,8 +78,9 @@ sessions survive an engine restart. Every shipped executable is built from the R
 Agent support is data, not code. Each agent is one JSON file in
 `diri/crates/diri-engine/manifests/` describing how to spawn it, how to resume, which keys
 approve or deny a prompt, and the screen rules that decide whether it is working, waiting, or
-done. Copy the closest existing manifest and adjust it — no code changes required. This is the
-easiest way to contribute.
+done. Copy the closest existing manifest and adjust it — no code changes required. The
+[manifest-authoring guide](docs/AGENT-MANIFESTS.md) explains the schema, safe capture workflow,
+examples, overrides, and validation. This is the easiest way to contribute.
 
 ## Building from source
 

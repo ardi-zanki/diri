@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 #[cfg(not(unix))]
 use std::io::Read;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use diri_proto::{Method, SessionListResult, SessionRecord, SessionStatus};
+use diri_proto::{AgentReadinessResult, Method, SessionListResult, SessionRecord, SessionStatus};
 use dirijor_mcp::{Bridge, ControlClient, ControlFailure, default_socket_path};
 use serde_json::{Value, json};
 
@@ -842,6 +843,53 @@ fn ports(arguments: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentBinaryDiagnostic {
+    binary: String,
+    display_name: String,
+}
+
+impl AgentBinaryDiagnostic {
+    fn label(&self) -> String {
+        if self.display_name.eq_ignore_ascii_case(&self.binary) {
+            self.display_name.clone()
+        } else {
+            format!("{} ({})", self.display_name, self.binary)
+        }
+    }
+}
+
+/// Pure catalog-to-check-list mapping. PATH probing stays in `doctor`, so
+/// tests never depend on which optional agent CLIs a machine has installed.
+fn agent_binary_diagnostics(catalog: &AgentReadinessResult) -> Vec<AgentBinaryDiagnostic> {
+    let mut agents: Vec<_> = catalog.agents.iter().collect();
+    agents.sort_by(|left, right| left.kind.id().cmp(right.kind.id()));
+
+    let mut by_binary = BTreeMap::new();
+    for agent in agents {
+        if agent.kind.is_terminal()
+            || agent.kind.id() == "generic"
+            || agent.binary.trim().is_empty()
+        {
+            continue;
+        }
+        let display_name = agent
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(agent.binary.as_str())
+            .to_owned();
+        by_binary
+            .entry(agent.binary.clone())
+            .or_insert(AgentBinaryDiagnostic {
+                binary: agent.binary.clone(),
+                display_name,
+            });
+    }
+    by_binary.into_values().collect()
+}
+
 fn doctor() -> Result<(), CliError> {
     let socket = default_socket_path();
     let hello = request(
@@ -866,11 +914,22 @@ fn doctor() -> Result<(), CliError> {
             error.message
         ),
     }
-    for binary in ["claude", "codex"] {
-        if let Some(path) = which(binary) {
-            println!("✓ {binary} found at {}", path.display());
-        } else {
-            println!("✗ {binary} not found on PATH");
+    if daemon_ok {
+        match request(Method::AGENT_READINESS, json!({}), Duration::from_secs(3)) {
+            Ok(value) => match serde_json::from_value::<AgentReadinessResult>(value) {
+                Ok(catalog) => {
+                    for diagnostic in agent_binary_diagnostics(&catalog) {
+                        let label = diagnostic.label();
+                        if let Some(path) = which(&diagnostic.binary) {
+                            println!("✓ {label} found at {}", path.display());
+                        } else {
+                            println!("✗ {label} not found on PATH");
+                        }
+                    }
+                }
+                Err(error) => println!("✗ Agent catalog unreadable ({error})"),
+            },
+            Err(error) => println!("✗ Agent catalog unavailable ({})", error.message),
         }
     }
     let state = socket
@@ -1105,7 +1164,10 @@ fn stdin_json(cap: usize, timeout: Duration) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::{AgentKind, DateMillis, ProjectId, Resumability, SessionId, TitleSource};
+    use diri_proto::{
+        AgentDescriptor, AgentKind, AgentReadinessItem, DateMillis, ProjectId, Resumability,
+        SessionId, TitleSource,
+    };
 
     fn record(id: &str, title: &str) -> SessionRecord {
         SessionRecord {
@@ -1168,5 +1230,51 @@ mod tests {
             "tests".into(),
         ];
         assert_eq!(positionals(&args), vec!["s_a", "run", "the", "tests"]);
+    }
+
+    #[test]
+    fn doctor_derives_distinct_deterministic_binary_checks_from_the_catalog() {
+        let item = |id: &str, binary: &str, display_name: &str| AgentReadinessItem {
+            kind: AgentKind::new(id),
+            binary: binary.into(),
+            path: None,
+            descriptor: Some(AgentDescriptor {
+                id: id.into(),
+                display_name: display_name.into(),
+                ..AgentDescriptor::default()
+            }),
+        };
+        let catalog = AgentReadinessResult {
+            agents: vec![
+                item("zeta", "shared-agent", "Zeta Agent"),
+                item("beta", "beta", "Beta"),
+                item("alpha", "shared-agent", "Alpha Agent"),
+                item("shell", "/bin/zsh", "Shell"),
+                item("generic", "command", "Command"),
+                item("empty", "", "Empty"),
+            ],
+        };
+
+        let checks = agent_binary_diagnostics(&catalog);
+        assert_eq!(
+            checks,
+            vec![
+                AgentBinaryDiagnostic {
+                    binary: "beta".into(),
+                    display_name: "Beta".into(),
+                },
+                AgentBinaryDiagnostic {
+                    binary: "shared-agent".into(),
+                    display_name: "Alpha Agent".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .map(AgentBinaryDiagnostic::label)
+                .collect::<Vec<_>>(),
+            vec!["Beta", "Alpha Agent (shared-agent)"]
+        );
     }
 }
