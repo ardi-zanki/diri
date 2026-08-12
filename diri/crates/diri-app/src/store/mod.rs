@@ -37,6 +37,10 @@ pub use residency::{ResidencyUpdate, TerminalResidency};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
 
+fn agent_target_key(host: Option<&str>) -> String {
+    host.unwrap_or("local").to_owned()
+}
+
 pub(crate) fn is_auxiliary_terminal(session: &SessionRecord) -> bool {
     // `parent` was previously written to the wire but had no UI semantics.
     // Shell children now belong to their parent's workbench. Do not key this
@@ -132,6 +136,11 @@ pub enum StoreEffect {
         host: Option<String>,
         path: String,
     },
+    RefreshAgents {
+        host: Option<String>,
+        force: bool,
+    },
+    ConfigureAgent(diri_proto::AgentConfigureParams),
     ReopenLast,
     SetActive(bool),
     ConfigureGovernor(GovernorConfigureParams),
@@ -314,7 +323,9 @@ pub struct SessionStore {
     /// whether their CLI is installed, and each one's manifest descriptor.
     /// Empty until the first successful connect, and empty forever against a
     /// daemon too old to send descriptors — every reader must have a fallback.
-    agents: AgentReadinessResult,
+    agents: HashMap<String, AgentReadinessResult>,
+    agent_catalog_loading: HashSet<String>,
+    agent_catalog_errors: HashMap<String, String>,
     /// Attention states serving out their settle window, newest arming wins.
     /// Drained by the settle task in `StoreHandle`, which is what turns one of
     /// these into a chime and a banner — see `drain_settled_attention`.
@@ -376,7 +387,9 @@ impl SessionStore {
                 cached_projection: None,
                 prefs_path,
                 hosts: Vec::new(),
-                agents: AgentReadinessResult::default(),
+                agents: HashMap::new(),
+                agent_catalog_loading: HashSet::new(),
+                agent_catalog_errors: HashMap::new(),
                 attention_settle: HashMap::new(),
                 attention_wake: Arc::new(Notify::new()),
                 effects,
@@ -396,23 +409,76 @@ impl SessionStore {
 
     /// Installs the agent catalog fetched on connect.
     pub fn set_agent_catalog(&mut self, agents: AgentReadinessResult) {
-        self.agents = agents;
-        let repaired =
-            crate::agent_catalog::resolved_default_agent(&self.prefs.default_agent, &self.agents);
-        if repaired != self.prefs.default_agent {
-            self.prefs.default_agent = repaired;
-            let _ = self.persist_preferences();
-            self.invalidate_projection();
+        let local = agents.host.is_none();
+        let key = agent_target_key(agents.host.as_deref());
+        self.agent_catalog_loading.remove(&key);
+        self.agent_catalog_errors.remove(&key);
+        self.agents.insert(key, agents);
+        // Preserve Main's repair policy for the local preference. A remote
+        // target may legitimately have a different installed set and must not
+        // rewrite the user's global default merely because one host lacks it.
+        if local && let Some(catalog) = self.agent_catalog(None) {
+            let repaired =
+                crate::agent_catalog::resolved_default_agent(&self.prefs.default_agent, catalog);
+            if repaired != self.prefs.default_agent {
+                self.prefs.default_agent = repaired;
+                let _ = self.persist_preferences();
+                self.invalidate_projection();
+            }
         }
     }
 
-    pub fn agent_catalog(&self) -> &AgentReadinessResult {
+    pub fn agent_catalog(&self, host: Option<&str>) -> Option<&AgentReadinessResult> {
+        self.agents.get(&agent_target_key(host))
+    }
+
+    pub fn agent_catalogs(&self) -> &HashMap<String, AgentReadinessResult> {
         &self.agents
+    }
+
+    pub fn request_agent_catalog(&mut self, host: Option<String>, force: bool) {
+        let key = agent_target_key(host.as_deref());
+        // A failed scan leaves the catalog absent, and the failure's change
+        // broadcast re-renders the surfaces that ask for absent catalogs; a
+        // non-forced request after an error would therefore retry in a loop
+        // for as long as such a surface stays open. Only an explicit rescan
+        // gets past a recorded failure.
+        if !force && self.agent_catalog_errors.contains_key(&key) {
+            return;
+        }
+        if self.agent_catalog_loading.insert(key) {
+            self.emit(StoreEffect::RefreshAgents { host, force });
+        }
+    }
+
+    pub fn configure_agent(&mut self, params: diri_proto::AgentConfigureParams) {
+        // Configuration is a user mutation, not a cache refresh: it must reach
+        // the engine even while a scan for the same target is in flight, or a
+        // toggle flipped during a slow remote scan silently reverts.
+        self.agent_catalog_loading
+            .insert(agent_target_key(params.host.as_deref()));
+        self.emit(StoreEffect::ConfigureAgent(params));
+    }
+
+    pub fn agent_catalog_is_loading(&self, host: Option<&str>) -> bool {
+        self.agent_catalog_loading.contains(&agent_target_key(host))
+    }
+
+    pub fn agent_catalog_error(&self, host: Option<&str>) -> Option<&str> {
+        self.agent_catalog_errors
+            .get(&agent_target_key(host))
+            .map(String::as_str)
     }
 
     /// Manifest descriptor for a kind, when the daemon shipped one.
     pub fn agent_descriptor(&self, kind: &AgentKind) -> Option<&AgentDescriptor> {
-        self.agents.descriptor(kind)
+        self.agent_catalog(None)
+            .and_then(|catalog| catalog.descriptor(kind))
+            .or_else(|| {
+                self.agents
+                    .values()
+                    .find_map(|catalog| catalog.descriptor(kind))
+            })
     }
 
     /// Test/preview seam: inject a host catalog without touching the disk.
@@ -1259,7 +1325,7 @@ impl SessionStore {
                 self.selected_session_id.as_ref(),
                 self.app_is_active,
                 self.prefs.status_sounds,
-                self.agents.descriptor(session.effective_kind()),
+                self.agent_descriptor(session.effective_kind()),
             ) {
                 transitions.push(transition);
             }
@@ -2300,7 +2366,10 @@ impl StoreRuntime {
                         // descriptors for banner copy and approve keystrokes.
                         // Failure is non-fatal — an old daemon has no descriptors
                         // to give and every reader falls back.
-                        if let Ok(agents) = state_client.agent_readiness().await {
+                        if let Ok(agents) = state_client
+                            .agent_readiness(diri_proto::AgentReadinessParams::default())
+                            .await
+                        {
                             state_store
                                 .write()
                                 .expect("session store lock poisoned")
@@ -2321,6 +2390,33 @@ impl StoreRuntime {
                         };
                         let _ = state_client.set_active(active).await;
                         let _ = state_client.configure_governor(governor).await;
+                        // Warm the default remote only after local catalog,
+                        // session hydration and lifecycle state have completed.
+                        // A slow SSH login can then never delay first paint.
+                        let default_host = state_store
+                            .read()
+                            .expect("session store lock poisoned")
+                            .default_spawn_host();
+                        if let Some(host) = default_host {
+                            let client = Arc::clone(&state_client);
+                            let store = Arc::clone(&state_store);
+                            let changes = state_changes.clone();
+                            tokio::spawn(async move {
+                                if let Ok(catalog) = client
+                                    .agent_readiness(diri_proto::AgentReadinessParams {
+                                        host: Some(host),
+                                        force_refresh: false,
+                                    })
+                                    .await
+                                {
+                                    store
+                                        .write()
+                                        .expect("session store lock poisoned")
+                                        .set_agent_catalog(catalog);
+                                    let _ = changes.send(());
+                                }
+                            });
+                        }
                     }
                 }
                 let _ = state_changes.send(());
@@ -2605,6 +2701,61 @@ async fn run_effects(
                 });
                 Ok(())
             }
+            StoreEffect::RefreshAgents { host, force } => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .agent_readiness(diri_proto::AgentReadinessParams {
+                            host: host.clone(),
+                            force_refresh: force,
+                        })
+                        .await;
+                    let mut locked = store.write().expect("session store lock poisoned");
+                    let key = agent_target_key(host.as_deref());
+                    // Clear the requested key, not the one the response names:
+                    // a daemon too old for per-host params echoes no host, and
+                    // keying off the response would leave this target loading
+                    // (and every further request suppressed) forever.
+                    locked.agent_catalog_loading.remove(&key);
+                    match result {
+                        Ok(catalog) => {
+                            locked.agent_catalog_errors.remove(&key);
+                            locked.set_agent_catalog(catalog);
+                        }
+                        Err(error) => {
+                            locked.agent_catalog_errors.insert(key, error.to_string());
+                        }
+                    }
+                    let _ = change_tx.send(());
+                });
+                Ok(())
+            }
+            StoreEffect::ConfigureAgent(params) => {
+                let client = Arc::clone(&client);
+                let store = Arc::clone(&store);
+                let change_tx = change_tx.clone();
+                tokio::spawn(async move {
+                    let host = params.host.clone();
+                    let result = client.configure_agent(params).await;
+                    let mut locked = store.write().expect("session store lock poisoned");
+                    let key = agent_target_key(host.as_deref());
+                    // Requested key, not response key — see RefreshAgents.
+                    locked.agent_catalog_loading.remove(&key);
+                    match result {
+                        Ok(catalog) => {
+                            locked.agent_catalog_errors.remove(&key);
+                            locked.set_agent_catalog(catalog);
+                        }
+                        Err(error) => {
+                            locked.agent_catalog_errors.insert(key, error.to_string());
+                        }
+                    }
+                    let _ = change_tx.send(());
+                });
+                Ok(())
+            }
             StoreEffect::ReopenLast => match client.reopen_last().await {
                 Ok(record) => {
                     let id = record.id.clone();
@@ -2694,6 +2845,10 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         | StoreEffect::ConfigureGovernor(_)
         | StoreEffect::DetachAttachment(_)
         | StoreEffect::StatusTransition(_) => return None,
+        // Catalog failures land in `agent_catalog_errors`, which the Agents
+        // settings page and launch surfaces render in place — a toast on top
+        // would double-report every unreachable host.
+        StoreEffect::RefreshAgents { .. } | StoreEffect::ConfigureAgent(_) => return None,
     };
     Some(ActionContext { title, retry })
 }

@@ -689,6 +689,7 @@ mod tests {
                 submit: true,
             }),
             setup: None,
+            extra: Default::default(),
         };
         let current = session(
             amp.clone(),

@@ -216,7 +216,9 @@ mod tests {
                 binary: "codex".to_owned(),
                 path: Some("/Users/alice/secret-repo/bin/codex".to_owned()),
                 descriptor: None,
+                ..AgentReadinessItem::default()
             }],
+            ..AgentReadinessResult::default()
         };
         let hosts = vec![HostEntry {
             id: "forge".to_owned(),

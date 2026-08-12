@@ -232,6 +232,13 @@ impl RootView {
             if let SidebarEvent::Update(command) = event {
                 this.services.updates.send(command.clone());
             }
+            if let SidebarEvent::OpenAgentSettings(host) = event
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_agent_settings(host.clone(), cx);
+                });
+            }
             if matches!(event, SidebarEvent::AddRemoteHost)
                 && let Some(surfaces) = &this.utility_surfaces
             {
@@ -248,7 +255,14 @@ impl RootView {
         cx.subscribe_in(
             &launcher,
             window,
-            |this, _, _: &LauncherEvent, window, cx| {
+            |this, _, event: &LauncherEvent, window, cx| {
+                if let LauncherEvent::ManageAgents(host) = event
+                    && let Some(surfaces) = &this.utility_surfaces
+                {
+                    surfaces.update(cx, |surfaces, cx| {
+                        surfaces.open_agent_settings(host.clone(), cx);
+                    });
+                }
                 if let Some(terminal) = &this.terminal {
                     terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
                 } else {
@@ -592,14 +606,21 @@ impl RootView {
     /// mutations of RootView's child modules.
     fn run_command(&mut self, command: CommandId, window: &mut Window, cx: &mut Context<Self>) {
         match command {
+            // A spawn the catalog vetoes falls back to the launcher, where the
+            // unavailability is visible and another Agent is one keystroke
+            // away, instead of a shortcut that silently does nothing.
             CommandId::NewDefaultSession => {
-                self.spawn_default();
+                if !self.spawn_default() {
+                    self.open_launcher(&OpenLauncher, window, cx);
+                }
             }
             CommandId::NewTerminal => {
                 self.spawn(None);
             }
             CommandId::NewCodexSession => {
-                self.spawn(Some(AgentKind::CODEX));
+                if !self.spawn(Some(AgentKind::CODEX)) {
+                    self.open_launcher(&OpenLauncher, window, cx);
+                }
             }
             CommandId::ToggleCommandPalette => {
                 if let Some(navigation) = &self.navigation {
@@ -708,6 +729,13 @@ impl RootView {
         match agent {
             Some(agent) => {
                 let host = store.default_spawn_host();
+                if !crate::agent_catalog::kind_spawnable(
+                    &agent,
+                    store.agent_catalog(host.as_deref()),
+                ) {
+                    store.request_agent_catalog(host, false);
+                    return false;
+                }
                 store.spawn_kind(
                     agent,
                     SpawnOptions {
@@ -725,12 +753,25 @@ impl RootView {
         if self.preview {
             return false;
         }
-        self.services
+        let mut store = self
+            .services
             .store
             .store
             .write()
-            .expect("session store lock poisoned")
-            .spawn_default(SpawnOptions::default());
+            .expect("session store lock poisoned");
+        let host = store.default_spawn_host();
+        let kind = store.preferences().default_agent.clone();
+        if !crate::agent_catalog::kind_spawnable(&kind, store.agent_catalog(host.as_deref())) {
+            store.request_agent_catalog(host, false);
+            return false;
+        }
+        store.spawn_kind(
+            kind,
+            SpawnOptions {
+                host,
+                ..SpawnOptions::default()
+            },
+        );
         true
     }
 

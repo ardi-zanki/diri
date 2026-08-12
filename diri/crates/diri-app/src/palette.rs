@@ -3,13 +3,15 @@
 //! The ordering and labels mirror `CommandPaletteView.swift`; UI code only
 //! renders these specs and dispatches the associated command.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
 use diri_proto::{AgentKind, AgentReadinessResult, HostEntry, Project, SessionRecord};
 
 use crate::agent_catalog::{
-    AgentOption, agent_options, display_name, resolved_default_agent, system_image,
+    AgentOption, agent_options, display_name, quick_agent_options, resolved_default_agent,
+    system_image,
 };
 use crate::commands::{self, CommandId};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
@@ -51,6 +53,195 @@ pub struct PaletteAction {
     /// "New Claude Code in anara", a host's ssh target, and the synonyms people
     /// actually type ("shell" for New Terminal, "preferences" for Settings).
     pub keywords: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectTarget {
+    pub project: Project,
+    pub host: Option<String>,
+}
+
+/// Catalog-aware action builder used by the live app. The older wrappers below
+/// remain deterministic fixtures for palette ranking tests.
+pub fn actions_for_catalogs(
+    default_agent: AgentKind,
+    projects: &[ProjectTarget],
+    hosts: &[HostEntry],
+    selected: Option<&SessionRecord>,
+    default_host_id: Option<&str>,
+    catalogs: &HashMap<String, AgentReadinessResult>,
+) -> Vec<PaletteAction> {
+    // Only the default target's catalog is warmed at connect. A host whose
+    // scan has not run yet must not lose its rows to that accident of timing —
+    // fall back to the local catalog as the optimistic guess, the way these
+    // actions were built before per-host catalogs; spawn-time discovery on
+    // the host stays the authority.
+    let catalog = |host: Option<&str>| {
+        catalogs
+            .get(host.unwrap_or("local"))
+            .or_else(|| catalogs.get("local"))
+    };
+    let default_host = default_host_id.and_then(|id| hosts.iter().find(|host| host.id == id));
+    let default_host_id = default_host.map(|host| host.id.as_str());
+    let mut result = Vec::new();
+    let default_agents = quick_agent_options(catalog(default_host_id));
+    let has_default = default_agents
+        .iter()
+        .any(|agent| agent.kind == default_agent);
+    for (index, agent) in default_agents.into_iter().enumerate() {
+        if agent.kind == AgentKind::SHELL {
+            continue;
+        }
+        let is_default = agent.kind == default_agent || (index == 0 && !has_default);
+        result.push(new_dynamic_agent_action(
+            agent.kind,
+            agent.display_name,
+            is_default,
+            default_host,
+            None,
+        ));
+    }
+    let terminal_title = default_host.map_or_else(
+        || "New Terminal".to_owned(),
+        |host| format!("New Terminal on {}", host.display_name()),
+    );
+    result.extend([
+        registered_action_with_title(CommandId::NewTerminal, terminal_title),
+        registered_action(CommandId::ToggleQuickOpen),
+        registered_action(CommandId::ToggleOverview),
+    ]);
+
+    for target in projects {
+        let agents = quick_agent_options(catalog(target.host.as_deref()));
+        let preferred = agents
+            .iter()
+            .filter(|agent| agent.kind != AgentKind::SHELL)
+            .find(|agent| agent.kind == default_agent)
+            .or_else(|| agents.iter().find(|agent| agent.kind != AgentKind::SHELL));
+        if let Some(agent) = preferred {
+            let target_host = target
+                .host
+                .as_deref()
+                .and_then(|id| hosts.iter().find(|host| host.id == id));
+            let mut action = new_dynamic_agent_action(
+                agent.kind.clone(),
+                agent.display_name.clone(),
+                false,
+                target_host,
+                Some(PathBuf::from(&target.project.root)),
+            );
+            action.title = target_host.map_or_else(
+                || format!("New {} in {}", agent.display_name, target.project.name),
+                |host| {
+                    format!(
+                        "New {} in {} on {}",
+                        agent.display_name,
+                        target.project.name,
+                        host.display_name()
+                    )
+                },
+            );
+            result.push(action);
+        }
+    }
+
+    for host in hosts {
+        if Some(host.id.as_str()) == default_host_id {
+            continue;
+        }
+        for agent in quick_agent_options(catalog(Some(&host.id))) {
+            if agent.kind == AgentKind::SHELL {
+                continue;
+            }
+            result.push(new_dynamic_agent_action(
+                agent.kind,
+                agent.display_name,
+                false,
+                Some(host),
+                None,
+            ));
+        }
+    }
+
+    append_management_actions(&mut result, hosts, selected);
+    result
+}
+
+fn new_dynamic_agent_action(
+    kind: AgentKind,
+    label: String,
+    shortcut: bool,
+    host: Option<&HostEntry>,
+    cwd: Option<PathBuf>,
+) -> PaletteAction {
+    let host_id = host.map(|host| host.id.clone());
+    let id = format!(
+        "new-{}-{}-{}",
+        kind.id(),
+        host_id.as_deref().unwrap_or("local"),
+        cwd.as_ref()
+            .map_or("default".into(), |path| path.to_string_lossy())
+    );
+    PaletteAction {
+        id,
+        title: host.map_or_else(
+            || format!("New {label} Session"),
+            |host| format!("New {label} on {}", host.display_name()),
+        ),
+        system_image: system_image_for_kind(&kind),
+        shortcut: shortcut
+            .then_some("⌘T")
+            .or_else(|| (kind == AgentKind::CODEX).then_some("⌘⇧N")),
+        command: PaletteCommand::SpawnAgent {
+            agent: kind.clone(),
+            cwd,
+            host: host_id,
+        },
+        detail: None,
+        enabled: true,
+        keywords: format!("{} {label} agent spawn start create", kind.id()),
+    }
+}
+
+fn system_image_for_kind(kind: &AgentKind) -> &'static str {
+    match kind.id() {
+        AgentKind::CLAUDE_CODE_ID => "sparkle",
+        AgentKind::CODEX_ID => "chevron.left.forwardslash.chevron.right",
+        AgentKind::CURSOR_ID => "cube",
+        AgentKind::GEMINI_ID => "sparkles",
+        _ => "terminal",
+    }
+}
+
+fn append_management_actions(
+    result: &mut Vec<PaletteAction>,
+    hosts: &[HostEntry],
+    selected: Option<&SessionRecord>,
+) {
+    result.extend(
+        actions_for_default_host(
+            AgentKind::SHELL,
+            &AgentReadinessResult::default(),
+            &[],
+            hosts,
+            selected,
+            None,
+        )
+        .into_iter()
+        .filter(|action| {
+            matches!(
+                action.command,
+                PaletteCommand::MigrateSelected { .. }
+                    | PaletteCommand::SyncPrefs { .. }
+                    | PaletteCommand::Action(
+                        CommandId::OpenWorktrees
+                            | CommandId::ToggleSidebar
+                            | CommandId::OpenSettings
+                            | CommandId::CheckForUpdates
+                    )
+            )
+        }),
+    );
 }
 
 pub fn actions(
@@ -408,7 +599,7 @@ fn agent_keyword(kind: &AgentKind) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use diri_proto::{AgentDescriptor, AgentReadinessItem, AgentSetup, ProjectId};
+    use diri_proto::{AgentDescriptor, AgentPathSource, AgentReadinessItem, AgentSetup, ProjectId};
 
     use super::*;
 
@@ -423,10 +614,16 @@ mod tests {
         setup_url: Option<&str>,
         sign_in_hint: Option<&str>,
     ) -> AgentReadinessItem {
+        let path = available.then(|| format!("/bin/{id}"));
         AgentReadinessItem {
             kind: AgentKind::new(id),
             binary: format!("{id}-bin"),
-            path: available.then(|| format!("/bin/{id}")),
+            path: path.clone(),
+            detected_path: path,
+            configured_path: None,
+            path_source: available.then_some(AgentPathSource::SystemPath),
+            show_in_quick_create: available,
+            error: None,
             descriptor: Some(AgentDescriptor {
                 id: id.into(),
                 display_name: display_name.into(),
@@ -440,10 +637,17 @@ mod tests {
         }
     }
 
+    fn installed_agent(id: &str, label: &str, show: bool) -> AgentReadinessItem {
+        let mut item = catalog_item(id, label, true, None, None);
+        item.show_in_quick_create = show;
+        item
+    }
+
     #[test]
     fn manifest_only_agents_get_typed_default_and_contextual_remote_actions() {
         let catalog = AgentReadinessResult {
             agents: vec![catalog_item("amp", "Amp", true, None, None)],
+            ..AgentReadinessResult::default()
         };
         let host = HostEntry {
             id: "forge".into(),
@@ -486,6 +690,7 @@ mod tests {
                 Some("https://ampcode.com/manual"),
                 Some("Sign in at ampcode.com, then run amp."),
             )],
+            ..AgentReadinessResult::default()
         };
         let actions = actions(AgentKind::new("amp"), &catalog, &[], &[], None);
         let amp = actions
@@ -509,6 +714,7 @@ mod tests {
     fn unavailable_action_without_setup_metadata_is_disabled_not_a_noop() {
         let catalog = AgentReadinessResult {
             agents: vec![catalog_item("private", "Private", false, None, None)],
+            ..AgentReadinessResult::default()
         };
         let actions = actions(AgentKind::new("private"), &catalog, &[], &[], None);
         let private = actions
@@ -527,12 +733,101 @@ mod tests {
     }
 
     #[test]
+    fn live_palette_uses_target_catalog_without_duplicate_default_host_actions() {
+        let host = HostEntry {
+            id: "forge".into(),
+            name: Some("Forge".into()),
+            ssh: "forge".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let catalogs = HashMap::from([(
+            "forge".into(),
+            AgentReadinessResult {
+                host: Some("forge".into()),
+                scanned_at: None,
+                agents: vec![
+                    installed_agent("codex", "Codex", true),
+                    installed_agent("aider", "Aider", false),
+                ],
+            },
+        )]);
+        let actions = actions_for_catalogs(
+            AgentKind::CLAUDE_CODE,
+            &[],
+            std::slice::from_ref(&host),
+            None,
+            Some("forge"),
+            &catalogs,
+        );
+        let codex = actions
+            .iter()
+            .filter(|action| action.id.starts_with("new-codex-forge"))
+            .collect::<Vec<_>>();
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].shortcut, Some("⌘T"));
+        assert!(!actions.iter().any(|action| action.id.contains("aider")));
+    }
+
+    #[test]
+    fn a_host_whose_catalog_has_not_been_fetched_keeps_its_actions() {
+        let host = HostEntry {
+            id: "forge".into(),
+            name: Some("Forge".into()),
+            ssh: "forge".into(),
+            default_cwd: None,
+            node: None,
+        };
+        // Only the local catalog is warmed at connect; forge has never been
+        // scanned. Its rows fall back to the local catalog instead of
+        // silently vanishing until some surface happens to trigger a scan.
+        let catalogs = HashMap::from([(
+            "local".to_owned(),
+            AgentReadinessResult {
+                agents: vec![installed_agent("codex", "Codex", true)],
+                ..AgentReadinessResult::default()
+            },
+        )]);
+        let actions = actions_for_catalogs(
+            AgentKind::CODEX,
+            &[ProjectTarget {
+                project: Project {
+                    id: ProjectId::new("p1"),
+                    root: "/srv/app".into(),
+                    name: "app".into(),
+                    pinned_order: None,
+                    host: Some("forge".into()),
+                },
+                host: Some("forge".into()),
+            }],
+            std::slice::from_ref(&host),
+            None,
+            None,
+            &catalogs,
+        );
+        assert!(actions.iter().any(|action| {
+            action.command
+                == PaletteCommand::SpawnAgent {
+                    agent: AgentKind::new("codex"),
+                    cwd: None,
+                    host: Some("forge".into()),
+                }
+        }));
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.title == "New Codex in app on Forge")
+        );
+    }
+
+    #[test]
     fn action_list_matches_swift_order_and_dynamic_default() {
         let project = Project {
             id: ProjectId::new("p1"),
             root: "/work/diri".into(),
             name: "diri".into(),
             pinned_order: None,
+            host: None,
         };
         let result = actions(AgentKind::CODEX, &catalog(), &[project], &[], None);
         let ids: Vec<_> = result.iter().map(|action| action.id.as_str()).collect();
@@ -762,6 +1057,7 @@ mod tests {
             root: root.into(),
             name: name.into(),
             pinned_order: None,
+            host: None,
         }
     }
 
