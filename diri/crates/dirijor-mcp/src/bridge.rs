@@ -910,6 +910,7 @@ mod tests {
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::Live,
             parent: parent.map(SessionId::new),
