@@ -11,6 +11,8 @@ and a daemon restart brings conversations back.
 
 ![diri](docs/images/diri.png)
 
+<p align="center"><img src="docs/images/diri-divider-status.png" alt="" width="760"></p>
+
 ## Install
 
 ```sh
@@ -20,6 +22,8 @@ brew install --cask cristicretu/diri/diri
 Or download the latest DMG from [Releases](https://github.com/cristicretu/diri/releases/latest),
 open it, and drag diri to Applications. Either way it is the same universal build (Apple
 silicon and Intel), signed and notarized. diri updates itself from there.
+
+<p align="center"><img src="docs/images/diri-install.png" alt="Diri moving the app into the Applications folder" width="680"></p>
 
 The tap has to be named in full — a bare `diri` resolves only against Homebrew's default
 taps. The cask lives in [cristicretu/homebrew-diri](https://github.com/cristicretu/homebrew-diri)
@@ -41,6 +45,8 @@ macOS 15 or newer.
 The [getting-started guide](docs/GETTING_STARTED.md) covers remote hosts, MCP
 orchestration, diagnostics, local data, and uninstalling.
 
+<p align="center"><img src="docs/images/diri-divider-worktrees.png" alt="" width="760"></p>
+
 ## What it does
 
 - **Many agents at once.** Each session is a real terminal with a real PTY. Group them by
@@ -56,9 +62,13 @@ orchestration, diagnostics, local data, and uninstalling.
 First-class status detection and resume are Claude Code and Codex. Cursor and Gemini run with
 partial support, and anything else runs as a terminal with running/exited status.
 
+![Claude Code, Codex, Cursor, Gemini, and shell agents](docs/images/diri-agent-lineup.png)
+
 ## Architecture
 
 Two processes, one wire protocol:
+
+![Diri architecture: app and CLI connect through the control socket to the engine, persistent PTY holders, and coding agents](docs/images/diri-architecture.png)
 
 - **`diri`** — the desktop app: Rust + [GPUI](https://github.com/zed-industries/zed). Owns the
   window, sidebar, terminal renderer, command palette, and usage accounting. Lives in
