@@ -1243,6 +1243,7 @@ mod tests {
                 display_name: display_name.into(),
                 ..AgentDescriptor::default()
             }),
+            ..AgentReadinessItem::default()
         };
         let catalog = AgentReadinessResult {
             agents: vec![
@@ -1253,6 +1254,7 @@ mod tests {
                 item("generic", "command", "Command"),
                 item("empty", "", "Empty"),
             ],
+            ..AgentReadinessResult::default()
         };
 
         let checks = agent_binary_diagnostics(&catalog);

@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diri_proto::HostEntry;
 use diri_proto::remote_pty::{
@@ -33,6 +33,7 @@ use super::ssh::{HelperCommand, SshTransport};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const RPC_TIMEOUT: Duration = Duration::from_secs(120);
+const PERSISTENCE_LOGOUT_SETTLE: Duration = Duration::from_secs(1);
 // Environment capture alone is bounded at 1 MiB; executable discovery adds a
 // bounded result row per query to that same response.
 const MAX_RPC_OUTPUT: usize = 2 * 1024 * 1024;
@@ -226,7 +227,7 @@ impl RemoteManager {
 
     /// Closes finite-lived OpenSSH multiplexers after the owning Engine has
     /// become fully idle. Live remote sessions never call this path.
-    pub fn close_control_masters(&self) {
+    pub fn close_control_masters(&self) -> io::Result<()> {
         let transports = self
             .current_helpers
             .lock()
@@ -234,14 +235,47 @@ impl RemoteManager {
             .values()
             .map(|current| current.helper.transport.clone())
             .collect::<Vec<_>>();
+        let mut result = Ok(());
         for transport in transports {
-            let _ = self.executor.run(
-                transport.control_exit(),
-                Vec::new(),
-                Duration::from_secs(2),
-                4 * 1024,
-            );
+            if let Err(error) = self.close_control_master(&transport)
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
         }
+        result
+    }
+
+    /// Ends Diri's shared SSH connection and waits for its local control
+    /// socket to disappear. A missing socket means there is no master to hide
+    /// logout cleanup; any other failed teardown is a correctness error for a
+    /// persistence probe.
+    fn close_control_master(&self, transport: &SshTransport) -> io::Result<()> {
+        let output = self.executor.run(
+            transport.control_exit(),
+            Vec::new(),
+            Duration::from_secs(2),
+            4 * 1024,
+        )?;
+        if !output.status.success() && transport.control_path().exists() {
+            return Err(io::Error::other(format!(
+                "SSH control-master teardown failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while transport.control_path().exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if transport.control_path().exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH control master did not close before the persistence probe",
+            ));
+        }
+        Ok(())
     }
 
     fn verify_cached_current(&self, host: &HostEntry) -> io::Result<Option<InstalledHelper>> {
@@ -562,8 +596,9 @@ impl RemoteManager {
         )
     }
 
-    /// Tests survival across two distinct SSH command channels. The result is
-    /// cached only for this Engine lifetime and never inferred from `setsid`.
+    /// Tests survival after one SSH connection closes and over a second,
+    /// independently authenticated connection. The result is cached only for
+    /// this Engine lifetime and never inferred from `setsid`.
     pub fn probe_persistence(
         &self,
         host: &HostEntry,
@@ -579,6 +614,12 @@ impl RemoteManager {
         {
             return Ok(capability);
         }
+
+        // Bootstrap and ordinary RPCs may have left a finite-lived
+        // ControlMaster behind. Close it before starting the witness, then use
+        // only non-multiplexed persistence RPCs so the Begin command cannot
+        // return until its underlying SSH connection is gone.
+        self.close_control_master(&helper.transport)?;
 
         let native = self.probe_persistence_mode(helper, PersistenceProbeAction::BeginNative)?;
         let supervised = if native {
@@ -613,7 +654,7 @@ impl RemoteManager {
             // The begin SSH command has exited before `rpc` returns. This
             // margin lets login-scope cleanup finish before a separate
             // channel checks the witness.
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(PERSISTENCE_LOGOUT_SETTLE);
             self.rpc::<_, PersistenceProbeResult>(
                 helper,
                 HelperCommand::Persistence,
