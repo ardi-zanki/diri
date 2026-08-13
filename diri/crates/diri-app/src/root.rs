@@ -828,19 +828,10 @@ impl RootView {
             .write()
             .expect("session store lock poisoned");
         let host = store.default_spawn_host();
-        let kind = store.preferences().default_agent.clone();
-        if !crate::agent_catalog::kind_spawnable(&kind, store.agent_catalog(host.as_deref())) {
-            store.request_agent_catalog(host, false);
-            return false;
-        }
-        store.spawn_kind(
-            kind,
-            SpawnOptions {
-                host,
-                ..SpawnOptions::default()
-            },
-        );
-        true
+        store.spawn_default(SpawnOptions {
+            host,
+            ..SpawnOptions::default()
+        })
     }
 
     fn open_auxiliary_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {

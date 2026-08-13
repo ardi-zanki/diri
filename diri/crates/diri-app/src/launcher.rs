@@ -284,13 +284,17 @@ impl LauncherOverlay {
     }
 
     /// Keeps a saved default preference intact while making this invocation
-    /// usable on a target where that Agent is absent. It runs only after a
-    /// catalog exists, so an in-flight remote scan never causes a false
-    /// fallback or visual jump; and it judges by installed state, not quick
-    /// create visibility, so a hidden-but-installed default is not switched
-    /// away from.
+    /// usable on a target where that Agent is absent. It judges by installed
+    /// state, not quick-create visibility, so a hidden-but-installed default is
+    /// not switched away from.
+    ///
+    /// A target with no readiness facts yet is *unknown*, not empty, so the
+    /// selection is left alone: rewriting it to Terminal would silently discard
+    /// the user's Agent for the length of an SSH scan, and — because Terminal
+    /// is always spawnable — this would never run again to put it back.
+    /// `blocker` holds ⌘↵ until the scan answers instead.
     fn reconcile_harness(&mut self) {
-        let spawnable = {
+        let (spawnable, catalog_known) = {
             let store = self
                 .services
                 .store
@@ -298,12 +302,12 @@ impl LauncherOverlay {
                 .read()
                 .expect("session store lock poisoned");
             let catalog = store.agent_catalog(self.selected_host.as_deref());
-            if catalog.is_none() {
-                return;
-            }
-            crate::agent_catalog::kind_spawnable(&self.selected_harness, catalog)
+            (
+                crate::agent_catalog::kind_spawnable(&self.selected_harness, catalog),
+                catalog.is_some(),
+            )
         };
-        if spawnable {
+        if spawnable || !catalog_known {
             return;
         }
         let choices = self.harness_choices();
@@ -407,29 +411,43 @@ impl LauncherOverlay {
         if self.selected_root.is_empty() {
             return Some("Choose a project to start in".to_owned());
         }
-        let spawnable = {
+        let (spawnable, catalog_known, scan_error) = {
             let store = self
                 .services
                 .store
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            let catalog = store.agent_catalog(self.selected_host.as_deref());
-            // No catalog means a scan is in flight or failed, not that the
-            // Agent is absent: submitting stays possible and the daemon's
-            // spawn-time check remains the authority. Claiming "not
-            // available" here would block ⌘↵ for the length of an SSH scan —
-            // or forever, when the scan errored.
-            crate::agent_catalog::kind_spawnable(&self.selected_harness, catalog)
+            let host = self.selected_host.as_deref();
+            let catalog = store.agent_catalog(host);
+            (
+                crate::agent_catalog::kind_spawnable(&self.selected_harness, catalog),
+                catalog.is_some(),
+                store.agent_catalog_error(host).map(str::to_owned),
+            )
         };
         if spawnable {
-            None
-        } else {
-            Some(format!(
+            return None;
+        }
+        if catalog_known {
+            return Some(format!(
                 "{} is not available on this host",
                 self.selected_harness_label()
-            ))
+            ));
         }
+        // Readiness for this target has not answered yet, so submitting would
+        // spawn blind. Name the state rather than claiming absence — and leave
+        // the Agent menu usable, since picking Terminal explicitly stays a
+        // valid escape hatch when a scan cannot answer at all.
+        Some(scan_error.map_or_else(
+            || {
+                format!(
+                    "Checking whether {} is available here…",
+                    self.selected_harness_label()
+                )
+            },
+            |error| format!("Could not check Agents on this host: {error}"),
+        ))
     }
 
     fn can_submit(&self) -> bool {
