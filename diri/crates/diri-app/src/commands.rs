@@ -32,6 +32,7 @@ actions!(
         OpenWorktrees,
         OpenSettings,
         ToggleSidebar,
+        FocusSidebar,
         ToggleInspector,
         ToggleAuxiliaryTerminal,
         ArchiveSelectedSession,
@@ -91,6 +92,7 @@ pub enum CommandId {
     OpenWorktrees,
     OpenSettings,
     ToggleSidebar,
+    FocusSidebar,
     ToggleInspector,
     ToggleAuxiliaryTerminal,
     ArchiveSelectedSession,
@@ -293,6 +295,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Toggle Sidebar",
         "sidebar.left",
         "hide show panel"
+    ),
+    spec!(
+        FocusSidebar,
+        "focus-sidebar",
+        Some("cmd-shift-b"),
+        Some("⇧⌘B"),
+        Some(APP_CONTEXT),
+        "Focus Sidebar",
+        "sidebar.left",
+        "keyboard sessions navigation focus"
     ),
     spec!(
         ToggleInspector,
@@ -552,6 +564,7 @@ impl CommandSpec {
             CommandId::OpenWorktrees => KeyBinding::new(key, OpenWorktrees, context),
             CommandId::OpenSettings => KeyBinding::new(key, OpenSettings, context),
             CommandId::ToggleSidebar => KeyBinding::new(key, ToggleSidebar, context),
+            CommandId::FocusSidebar => KeyBinding::new(key, FocusSidebar, context),
             CommandId::ToggleInspector => KeyBinding::new(key, ToggleInspector, context),
             CommandId::ToggleAuxiliaryTerminal => {
                 KeyBinding::new(key, ToggleAuxiliaryTerminal, context)
@@ -663,6 +676,7 @@ impl CommandId {
             Self::OpenWorktrees => Box::new(OpenWorktrees),
             Self::OpenSettings => Box::new(OpenSettings),
             Self::ToggleSidebar => Box::new(ToggleSidebar),
+            Self::FocusSidebar => Box::new(FocusSidebar),
             Self::ToggleInspector => Box::new(ToggleInspector),
             Self::ToggleAuxiliaryTerminal => Box::new(ToggleAuxiliaryTerminal),
             Self::ArchiveSelectedSession => Box::new(ArchiveSelectedSession),
@@ -764,6 +778,14 @@ mod tests {
             command(CommandId::SelectNextSession).alternate_keystrokes,
             ["cmd-alt-down", "cmd-]"]
         );
+    }
+
+    #[test]
+    fn sidebar_focus_has_a_global_explicit_shortcut() {
+        let focus = command(CommandId::FocusSidebar);
+        assert_eq!(focus.keystroke, Some("cmd-shift-b"));
+        assert_eq!(focus.context, Some(APP_CONTEXT));
+        assert_eq!(focus.shortcut, Some("⇧⌘B"));
     }
 
     #[test]
