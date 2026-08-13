@@ -9,25 +9,33 @@
 //! waits for the user to quit or request a restart, so an update never steals
 //! focus or interrupts a live session.
 
+use std::sync::Arc;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "macos", test))]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use diri_updater::{
-    Release, Result as UpdateResult, StagedUpdate, UpdateError, Updater, UpdaterConfig,
-};
+use diri_updater::Release;
+#[cfg(target_os = "macos")]
+use diri_updater::UpdaterConfig;
+#[cfg(any(target_os = "macos", test))]
+use diri_updater::{Result as UpdateResult, StagedUpdate, UpdateError, Updater};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 
 /// How long after launch the first background check runs. Long enough to stay
 /// out of the way of startup work.
+#[cfg(any(target_os = "macos", test))]
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(20);
+#[cfg(any(target_os = "macos", test))]
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Small seam around the blocking updater so the service policy can be tested
 /// without a network request or a signed app bundle.
+#[cfg(any(target_os = "macos", test))]
 trait UpdateBackend: Send + Sync {
     fn clean_cache(&self);
     fn check(&self, skipped: Option<&str>) -> UpdateResult<Option<Release>>;
@@ -39,6 +47,7 @@ trait UpdateBackend: Send + Sync {
     fn install(&self, staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()>;
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl UpdateBackend for Updater {
     fn clean_cache(&self) {
         Updater::clean_cache(self);
@@ -62,6 +71,7 @@ impl UpdateBackend for Updater {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone)]
 struct ReadyInstall {
     updater: Arc<dyn UpdateBackend>,
@@ -162,6 +172,7 @@ pub enum UpdateCommand {
 pub struct UpdateHandle {
     state: watch::Receiver<UpdateState>,
     commands: mpsc::UnboundedSender<UpdateCommand>,
+    #[cfg(any(target_os = "macos", test))]
     ready_install: Arc<Mutex<Option<ReadyInstall>>>,
     automatic: Arc<AtomicBool>,
     // Preview mode keeps the watch open without spawning the updater service.
@@ -193,6 +204,7 @@ impl UpdateHandle {
     /// Launches the non-reopening swap helper when an automatic update is
     /// staged. This path is synchronous and bounded so quitting never waits
     /// behind an in-progress network download on the service task.
+    #[cfg(any(target_os = "macos", test))]
     pub fn install_on_quit(&self) {
         if !self.automatic.load(Ordering::SeqCst) {
             return;
@@ -206,6 +218,9 @@ impl UpdateHandle {
             *self.ready_install.lock().expect("ready update") = Some(ready);
         }
     }
+
+    #[cfg(not(any(target_os = "macos", test)))]
+    pub fn install_on_quit(&self) {}
 }
 
 /// Starts the update service on `runtime` and returns the UI handle.
@@ -213,42 +228,70 @@ impl UpdateHandle {
 /// Never fails: a build that cannot update itself still gets a handle, parked
 /// in [`UpdatePhase::Unsupported`], so no caller needs an `Option`.
 pub fn spawn(runtime: &Arc<Runtime>, automatic: bool, skipped: Option<String>) -> UpdateHandle {
-    let initial = UpdateState {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (runtime, automatic, skipped);
+        unsupported("Use the installed package or download a newer Linux release from GitHub")
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let initial = UpdateState {
+            current_version: CURRENT_VERSION.to_owned(),
+            ..UpdateState::default()
+        };
+        let (state_tx, state_rx) = watch::channel(initial.clone());
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let ready_install = Arc::new(Mutex::new(None));
+        let automatic_flag = Arc::new(AtomicBool::new(automatic));
+
+        let updater: Option<Arc<dyn UpdateBackend>> =
+            match UpdaterConfig::for_running_app(CURRENT_VERSION) {
+                Ok(config) => Some(Arc::new(Updater::new(config))),
+                Err(error) => {
+                    state_tx.send_replace(UpdateState {
+                        phase: UpdatePhase::Unsupported(error.to_string()),
+                        ..initial
+                    });
+                    None
+                }
+            };
+
+        let _guard = runtime.enter();
+        tokio::spawn(service(
+            updater,
+            automatic,
+            skipped,
+            state_tx,
+            command_rx,
+            Arc::clone(&ready_install),
+        ));
+        UpdateHandle {
+            state: state_rx,
+            commands: command_tx,
+            ready_install,
+            automatic: automatic_flag,
+            _inert_state: None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unsupported(reason: impl Into<String>) -> UpdateHandle {
+    let state = UpdateState {
+        phase: UpdatePhase::Unsupported(reason.into()),
         current_version: CURRENT_VERSION.to_owned(),
         ..UpdateState::default()
     };
-    let (state_tx, state_rx) = watch::channel(initial.clone());
-    let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let ready_install = Arc::new(Mutex::new(None));
-    let automatic_flag = Arc::new(AtomicBool::new(automatic));
-
-    let updater: Option<Arc<dyn UpdateBackend>> =
-        match UpdaterConfig::for_running_app(CURRENT_VERSION) {
-            Ok(config) => Some(Arc::new(Updater::new(config))),
-            Err(error) => {
-                state_tx.send_replace(UpdateState {
-                    phase: UpdatePhase::Unsupported(error.to_string()),
-                    ..initial
-                });
-                None
-            }
-        };
-
-    let _guard = runtime.enter();
-    tokio::spawn(service(
-        updater,
-        automatic,
-        skipped,
-        state_tx,
-        command_rx,
-        Arc::clone(&ready_install),
-    ));
+    let (state_tx, state_rx) = watch::channel(state);
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
-        ready_install,
-        automatic: automatic_flag,
-        _inert_state: None,
+        #[cfg(any(target_os = "macos", test))]
+        ready_install: Arc::new(Mutex::new(None)),
+        automatic: Arc::new(AtomicBool::new(false)),
+        _inert_state: Some(state_tx),
     }
 }
 
@@ -264,12 +307,14 @@ pub fn inert() -> UpdateHandle {
     UpdateHandle {
         state: state_rx,
         commands: command_tx,
+        #[cfg(any(target_os = "macos", test))]
         ready_install: Arc::new(Mutex::new(None)),
         automatic: Arc::new(AtomicBool::new(false)),
         _inert_state: Some(state_tx),
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct Service {
     updater: Arc<dyn UpdateBackend>,
     state: watch::Sender<UpdateState>,
@@ -282,6 +327,7 @@ struct Service {
     ready_install: Arc<Mutex<Option<ReadyInstall>>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 async fn service(
     updater: Option<Arc<dyn UpdateBackend>>,
     automatic: bool,
@@ -334,6 +380,7 @@ async fn service(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Service {
     async fn handle(&mut self, command: UpdateCommand) {
         match command {

@@ -39,7 +39,7 @@ pub struct PaletteAction {
     pub id: String,
     pub title: String,
     pub system_image: &'static str,
-    pub shortcut: Option<&'static str>,
+    pub shortcut: Option<String>,
     /// Availability copy displayed in the trailing chip.
     pub detail: Option<String>,
     /// Disabled rows remain searchable as setup guidance, but cannot be
@@ -219,8 +219,13 @@ fn new_dynamic_agent_action(
         ),
         system_image: system_image_for_kind(&kind),
         shortcut: shortcut
-            .then_some("⌘T")
-            .or_else(|| (kind == AgentKind::CODEX).then_some("⌘⇧N")),
+            .then(|| commands::command(CommandId::NewDefaultSession).shortcut_label())
+            .flatten()
+            .or_else(|| {
+                (kind == AgentKind::CODEX)
+                    .then(|| commands::command(CommandId::NewCodexSession).shortcut_label())
+                    .flatten()
+            }),
         command: PaletteCommand::SpawnAgent {
             agent: kind.clone(),
             cwd,
@@ -452,7 +457,7 @@ fn registered_action_with_title(id: CommandId, title: String) -> PaletteAction {
         id: command.stable_id.into(),
         title,
         system_image: palette.system_image,
-        shortcut: command.shortcut,
+        shortcut: command.shortcut_label(),
         detail: None,
         enabled: true,
         command: PaletteCommand::Action(id),
@@ -466,7 +471,7 @@ fn default_action(title: String, system_image: &'static str, keywords: &str) -> 
         id: command.stable_id.into(),
         title,
         system_image,
-        shortcut: command.shortcut,
+        shortcut: command.shortcut_label(),
         detail: None,
         enabled: true,
         command: PaletteCommand::Action(CommandId::NewDefaultSession),
@@ -496,7 +501,7 @@ fn new_agent_action(
         system_image: system_image(&option.kind),
         shortcut: registered
             .or((option.kind == AgentKind::CODEX).then_some(CommandId::NewCodexSession))
-            .and_then(|id| commands::command(id).shortcut),
+            .and_then(|id| commands::command(id).shortcut_label()),
         detail: None,
         enabled: true,
         command: registered.map_or_else(
@@ -712,7 +717,10 @@ mod tests {
             None,
         );
         assert_eq!(actions[0].title, "New Amp Session");
-        assert_eq!(actions[0].shortcut, Some("⌘T"));
+        assert_eq!(
+            actions[0].shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
         assert_eq!(
             actions[0].command,
             PaletteCommand::Action(CommandId::NewDefaultSession)
@@ -787,7 +795,10 @@ mod tests {
             .filter(|action| action.id.starts_with("new-codex-forge"))
             .collect::<Vec<_>>();
         assert_eq!(codex.len(), 1);
-        assert_eq!(codex[0].shortcut, Some("⌘T"));
+        assert_eq!(
+            codex[0].shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
         assert!(!actions.iter().any(|action| action.id.contains("aider")));
     }
 
@@ -869,7 +880,10 @@ mod tests {
             .find(|action| action.id == "new-default")
             .expect("default action");
         assert_eq!(default.title, "New Saved Agent on Forge");
-        assert_eq!(default.shortcut, Some("⌘T"));
+        assert_eq!(
+            default.shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
         assert_eq!(
             default.command,
             PaletteCommand::Action(CommandId::NewDefaultSession)
@@ -902,7 +916,10 @@ mod tests {
             .find(|action| action.id == "new-default")
             .expect("default action");
         assert_eq!(default.title, "New Codex Session");
-        assert_eq!(default.shortcut, Some("⌘T"));
+        assert_eq!(
+            default.shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
     }
 
     #[test]
@@ -934,7 +951,10 @@ mod tests {
             ]
         );
         assert_eq!(result[0].title, "New Codex Session");
-        assert_eq!(result[0].shortcut, Some("⌘T"));
+        assert_eq!(
+            result[0].shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
         assert_eq!(result[1].title, "New Claude Code Session");
         assert_eq!(result[7].title, "New Codex in diri");
     }
@@ -1011,7 +1031,10 @@ mod tests {
         );
 
         assert_eq!(result[0].title, "New Claude Code on Forge");
-        assert_eq!(result[0].shortcut, Some("⌘T"));
+        assert_eq!(
+            result[0].shortcut,
+            commands::command(CommandId::NewDefaultSession).shortcut_label()
+        );
         assert_eq!(
             result[0].command,
             PaletteCommand::Action(CommandId::NewDefaultSession)
@@ -1021,7 +1044,10 @@ mod tests {
             .find(|action| action.id == "new-terminal")
             .expect("terminal action");
         assert_eq!(terminal.title, "New Terminal on Forge");
-        assert_eq!(terminal.shortcut, Some("⌥⌘T"));
+        assert_eq!(
+            terminal.shortcut,
+            commands::command(CommandId::NewTerminal).shortcut_label()
+        );
         assert_eq!(
             terminal.command,
             PaletteCommand::Action(CommandId::NewTerminal)

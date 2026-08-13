@@ -17,7 +17,7 @@ use gpui::{
 use crate::code_intelligence::{
     CodeIntelligence, CodeIntelligenceError, SearchHit, SearchHitKind, SourceSnapshot,
 };
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use diri_ui::{Appearance, FloatingSurface, Radius, SemanticColors, Typo};
 
@@ -741,7 +741,10 @@ impl Render for CodeViewer {
                 colors,
                 "cursorarrow.click.2",
                 "Open code from the terminal",
-                "⌘-click a file path, stack frame, or compiler location to inspect it here.",
+                format!(
+                    "{} a file path, stack frame, or compiler location to inspect it here.",
+                    crate::commands::primary_click_label()
+                ),
             ),
             ViewerState::Loading { reference } => self.render_message(
                 colors,

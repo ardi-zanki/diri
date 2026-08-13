@@ -34,6 +34,16 @@ pub const BUILD: &str = concat!(
     env!("DIRI_AGENT_CATALOG_BUILD_ID")
 );
 
+#[cfg(target_os = "macos")]
+const fn default_shell() -> &'static str {
+    "/bin/zsh"
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn default_shell() -> &'static str {
+    "/bin/sh"
+}
+
 pub struct ControlServer {
     registry: Arc<Mutex<Registry>>,
     socket_path: PathBuf,
@@ -717,11 +727,11 @@ impl ControlServer {
         let argv = if argv.is_empty() {
             match p.kind.command() {
                 Some(command) if !command.is_empty() => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
                     vec![shell, "-lc".into(), command.to_string()]
                 }
                 _ if kind == diri_proto::AgentKind::SHELL_ID => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
                     vec![shell, "-l".into()]
                 }
                 _ => Vec::new(),
