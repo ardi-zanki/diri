@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use diri_proto::{AgentKind, Project, SessionId};
 use diri_ui::{
@@ -11,12 +12,13 @@ use diri_ui::{
 };
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px,
+    KeyDownEvent, MouseButton, PathPromptOptions, Render, Task, Window, div, prelude::*, px, rgba,
 };
 
 use crate::AppServices;
 use crate::agent_catalog::{AgentOption, quick_agent_options, title_case_id};
 use crate::composer::PromptComposer;
+use crate::delegation::HandoffProposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::CARET;
 use crate::notifications::SendTextCommand;
@@ -96,6 +98,10 @@ pub(crate) struct LauncherOverlay {
     target: LauncherTarget,
     new_session_draft: String,
     session_drafts: HashMap<SessionId, String>,
+    mode: LauncherMode,
+    /// The active destination draft survives a temporary handoff proposal.
+    saved_new_prompt: Option<String>,
+    handoff_delivery: HandoffDeliveryState,
     selected_harness: AgentKind,
     selected_root: String,
     selected_host: Option<String>,
@@ -125,6 +131,48 @@ enum LauncherTarget {
     Session(SessionId),
 }
 
+#[derive(Clone, Debug)]
+enum LauncherMode {
+    NewSession,
+    Handoff(HandoffProposal),
+}
+
+/// One acknowledged handoff at a time. Tickets prevent a late completion
+/// from an old proposal from closing or annotating a newer composer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HandoffDeliveryState {
+    next_ticket: u64,
+    pending: Option<u64>,
+}
+
+impl HandoffDeliveryState {
+    fn begin(&mut self) -> Option<u64> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = Some(self.next_ticket);
+        self.pending
+    }
+
+    fn settle(&mut self, ticket: u64) -> bool {
+        if self.pending != Some(ticket) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        self.next_ticket = self.next_ticket.wrapping_add(1);
+        self.pending = None;
+    }
+
+    const fn is_sending(self) -> bool {
+        self.pending.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectCommit {
     Recent(usize),
@@ -144,7 +192,10 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
-                                if this.open && matches!(this.target, LauncherTarget::NewSession) {
+                                if this.open
+                                    && matches!(this.target, LauncherTarget::NewSession)
+                                    && matches!(this.mode, LauncherMode::NewSession)
+                                {
                                     this.reconcile_harness();
                                 }
                                 cx.notify();
@@ -166,6 +217,9 @@ impl LauncherOverlay {
             target: LauncherTarget::NewSession,
             new_session_draft: String::new(),
             session_drafts: HashMap::new(),
+            mode: LauncherMode::NewSession,
+            saved_new_prompt: None,
+            handoff_delivery: HandoffDeliveryState::default(),
             selected_harness,
             selected_root,
             selected_host,
@@ -184,6 +238,7 @@ impl LauncherOverlay {
     }
 
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_new_prompt();
         self.switch_target(LauncherTarget::NewSession);
         self.drop_notice = None;
         // A half-written prompt survives Escape. This used to clear on every
@@ -224,6 +279,7 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.restore_new_prompt();
         self.switch_target(LauncherTarget::NewSession);
         self.selected_root = root;
         self.selected_host = None;
@@ -243,6 +299,7 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.restore_new_prompt();
         self.switch_target(LauncherTarget::Session(session_id.clone()));
         self.prompt.append_context(insertion);
         self.drop_notice = notice;
@@ -285,6 +342,28 @@ impl LauncherOverlay {
         self.picker = None;
     }
 
+    /// Opens an identity-targeted review surface. Merely opening it cannot
+    /// write to either session; the only send path is the labelled confirmation
+    /// control rendered by `render_handoff_panel`.
+    pub(crate) fn open_handoff(
+        &mut self,
+        proposal: HandoffProposal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_new_prompt();
+        self.saved_new_prompt = Some(self.prompt.text().to_owned());
+        self.prompt.clear();
+        self.prompt.insert_multiline(&proposal.summary);
+        self.mode = LauncherMode::Handoff(proposal);
+        self.handoff_delivery.invalidate();
+        self.fallback_notice = None;
+        self.picker = None;
+        self.open = true;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
     }
@@ -295,6 +374,7 @@ impl LauncherOverlay {
         }
         self.open = false;
         self.picker = None;
+        self.restore_new_prompt();
         cx.emit(LauncherEvent::Closed);
         cx.notify();
     }
@@ -302,6 +382,20 @@ impl LauncherOverlay {
     /// Close from outside the launcher (sidebar session click, menu bar, etc.).
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.close(cx);
+    }
+
+    fn restore_new_prompt(&mut self) {
+        if !matches!(self.mode, LauncherMode::Handoff(_)) {
+            return;
+        }
+        self.handoff_delivery.invalidate();
+        self.prompt.clear();
+        if let Some(prompt) = self.saved_new_prompt.take()
+            && !prompt.is_empty()
+        {
+            self.prompt.insert_multiline(&prompt);
+        }
+        self.mode = LauncherMode::NewSession;
     }
 
     fn harness_choices(&self) -> Vec<AgentOption> {
@@ -424,6 +518,25 @@ impl LauncherOverlay {
     /// `None` means it can. The submit button used to just sit there dimmed
     /// with no explanation, which reads as "broken" rather than "not yet".
     fn blocker(&self) -> Option<String> {
+        if let LauncherMode::Handoff(proposal) = &self.mode {
+            if self.handoff_delivery.is_sending() {
+                return Some("Sending handoff…".to_owned());
+            }
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let Some(target) = store.sessions().get(&proposal.target_id) else {
+                return Some("The target session is no longer available".to_owned());
+            };
+            if target.is_archived() || matches!(target.status, diri_proto::SessionStatus::Exited(_))
+            {
+                return Some("The target session has ended".to_owned());
+            }
+            return None;
+        }
         if let LauncherTarget::Session(id) = &self.target {
             let store = self
                 .services
@@ -489,6 +602,46 @@ impl LauncherOverlay {
         if !self.can_submit() {
             return false;
         }
+        if let Some(command) = handoff_command(&self.mode, self.prompt.text()) {
+            let Some(ticket) = self.handoff_delivery.begin() else {
+                return false;
+            };
+            self.fallback_notice = None;
+            let client = Arc::clone(self.services.store.client());
+            let runtime = Arc::clone(&self.services.tokio);
+            cx.spawn(async move |this, cx| {
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client
+                        .send_text(&command.session_id, command.text, command.submit)
+                        .await
+                });
+                let result = match task.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("handoff task stopped: {error}")),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if !this.handoff_delivery.settle(ticket) {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
+                            this.prompt.clear();
+                            this.close(cx);
+                        }
+                        Err(error) => {
+                            this.fallback_notice = Some(format!(
+                                "The handoff was not sent: {error}. Review it and try again."
+                            ));
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+            return true;
+        }
         let prompt = self.prompt.text().trim().to_owned();
         match &self.target {
             LauncherTarget::NewSession => {
@@ -542,6 +695,13 @@ impl LauncherOverlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Submission is already explicit at this point. Freeze the editor
+        // until the daemon acknowledges it so post-submit edits cannot be
+        // mistaken for content that was delivered, and Escape cannot claim to
+        // cancel bytes already in flight.
+        if self.handoff_delivery.is_sending() {
+            return true;
+        }
         if self.picker.is_some() && self.handle_picker_key(event, window, cx) {
             return true;
         }
@@ -931,6 +1091,9 @@ impl LauncherOverlay {
         focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if matches!(self.mode, LauncherMode::Handoff(_)) {
+            return self.render_handoff_panel(colors, focused, cx);
+        }
         if matches!(self.target, LauncherTarget::Session(_)) {
             return self.render_session_panel(colors, focused, cx);
         }
@@ -1270,6 +1433,256 @@ impl LauncherOverlay {
             });
 
         panel.into_any_element()
+    }
+
+    fn render_handoff_panel(
+        &self,
+        colors: SemanticColors,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let LauncherMode::Handoff(proposal) = &self.mode else {
+            unreachable!("handoff panel requires a handoff proposal");
+        };
+        let sending = self.handoff_delivery.is_sending();
+        let can_submit = self.can_submit();
+        let blocker = self.blocker();
+        let text_height = composer_text_height(self.prompt.line_count());
+        let composer_height = text_height + COMPOSER_CONTROLS_HEIGHT;
+        let composer_fill = if colors.appearance == diri_ui::Appearance::Dark {
+            rgba(0x26282dff)
+        } else {
+            rgba(0xf2f1efff)
+        };
+        let remote_label = {
+            let store = self
+                .services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            store
+                .sessions()
+                .get(&proposal.target_id)
+                .and_then(|target| target.host.as_deref())
+                .map(|host| format!("Remote · {}", store.host_display_name(host)))
+        };
+        let prompt = if self.prompt.is_empty() {
+            div()
+                .h(px(COMPOSER_LINE_HEIGHT))
+                .flex()
+                .items_center()
+                .when(focused, |line| {
+                    line.child(div().text_color(colors.primary.alpha(0.92)).child(CARET))
+                })
+                .child(
+                    div()
+                        .text_color(colors.tertiary)
+                        .child("Describe the handoff…"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("handoff-prompt-lines")
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .track_scroll(self.prompt.scroll_handle())
+                .children(self.prompt.render_lines(
+                    px(COMPOSER_LINE_HEIGHT),
+                    focused.then_some(CARET),
+                    HighlightStyle {
+                        background_color: Some(Palette::CLAY.alpha(0.35).into()),
+                        ..HighlightStyle::default()
+                    },
+                ))
+                .into_any_element()
+        };
+
+        div()
+            .relative()
+            .w(px(PANEL_WIDTH))
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        div()
+                            .text_size(px(22.0))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(colors.primary.alpha(0.94))
+                            .child("Review handoff"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .text_size(px(11.0))
+                            .text_color(colors.secondary)
+                            .child(proposal.source_title.clone())
+                            .child(sf_symbol("arrow.right", 9.0, colors.tertiary))
+                            .child(proposal.target_title.clone())
+                            .when_some(remote_label, |row, label| {
+                                row.child(
+                                    div()
+                                        .ml(px(3.0))
+                                        .px(px(7.0))
+                                        .py(px(3.0))
+                                        .rounded(px(Radius::CHIP))
+                                        .bg(Ink::ATTENTION.alpha(0.11))
+                                        .border_1()
+                                        .border_color(Ink::ATTENTION.alpha(0.28))
+                                        .text_size(px(9.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(Ink::ATTENTION)
+                                        .child(label),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .mx(px(COMPOSER_INSET))
+                    .h(px(composer_height))
+                    .rounded(px(Radius::PANEL))
+                    .bg(composer_fill)
+                    .border_1()
+                    .border_color(if focused {
+                        Palette::CLAY.alpha(0.42)
+                    } else {
+                        colors.primary.alpha(0.09)
+                    })
+                    .cursor_text()
+                    .on_mouse_down(MouseButton::Left, {
+                        let focus = self.focus.clone();
+                        move |_, window, cx| window.focus(&focus, cx)
+                    })
+                    .child(
+                        div()
+                            .h(px(text_height))
+                            .px(px(COMPOSER_PADDING))
+                            .pt(px(COMPOSER_PAD_TOP))
+                            .pb(px(COMPOSER_PAD_BOTTOM))
+                            .text_size(px(COMPOSER_FONT_SIZE))
+                            .line_height(px(COMPOSER_LINE_HEIGHT))
+                            .text_color(colors.primary)
+                            .child(prompt),
+                    )
+                    .child(
+                        div()
+                            .h(px(COMPOSER_CONTROLS_HEIGHT))
+                            .px(px(10.0))
+                            .pb(px(8.0))
+                            .flex()
+                            .items_end()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .text_size(px(10.0))
+                                    .text_color(if self.fallback_notice.is_some() {
+                                        Ink::ATTENTION
+                                    } else {
+                                        colors.tertiary
+                                    })
+                                    .child(
+                                        blocker
+                                            .or_else(|| self.fallback_notice.clone())
+                                            .unwrap_or_else(|| {
+                                                "Review and edit before sending · ⇧↵ new line"
+                                                    .to_owned()
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(
+                                        div()
+                                            .id("handoff-cancel")
+                                            .h(px(CONTROL_SIZE))
+                                            .px(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(CONTROL_RADIUS))
+                                            .text_size(px(11.0))
+                                            .text_color(if sending {
+                                                colors.tertiary
+                                            } else {
+                                                colors.secondary
+                                            })
+                                            .when(!sending, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .hover(move |button| {
+                                                        button.bg(Fill::subtle(colors))
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.close(cx);
+                                                    }))
+                                            })
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("handoff-submit")
+                                            .h(px(CONTROL_SIZE))
+                                            .px(px(12.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .rounded(px(CONTROL_RADIUS))
+                                            .bg(if can_submit {
+                                                colors.primary
+                                            } else {
+                                                Fill::subtle(colors)
+                                            })
+                                            .when(can_submit, |button| {
+                                                button
+                                                    .cursor_pointer()
+                                                    .hover(move |button| button.opacity(0.86))
+                                                    .active(move |button| button.opacity(0.72))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.submit(cx);
+                                                    }))
+                                            })
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(if can_submit {
+                                                colors.background
+                                            } else {
+                                                colors.tertiary
+                                            })
+                                            .child(sf_symbol_weighted(
+                                                "paperplane.fill",
+                                                10.0,
+                                                SymbolWeight::Semibold,
+                                                if can_submit {
+                                                    colors.background
+                                                } else {
+                                                    colors.tertiary
+                                                },
+                                            ))
+                                            .child(if sending {
+                                                "Sending…"
+                                            } else {
+                                                "Send handoff"
+                                            }),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_session_panel(
@@ -1641,6 +2054,18 @@ fn transition_draft(
     }
 }
 
+fn handoff_command(mode: &LauncherMode, text: &str) -> Option<SendTextCommand> {
+    let LauncherMode::Handoff(proposal) = mode else {
+        return None;
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| SendTextCommand {
+        session_id: proposal.target_id.clone(),
+        text: text.to_owned(),
+        submit: true,
+    })
+}
+
 fn ui_agent_kind(kind: &AgentKind) -> UiAgentKind {
     match kind.id() {
         AgentKind::CLAUDE_CODE_ID => UiAgentKind::ClaudeCode,
@@ -1804,5 +2229,44 @@ mod tests {
             ),
             "unfinished new session"
         );
+    }
+
+    #[test]
+    fn handoff_is_inert_until_explicit_submit_builds_one_targeted_command() {
+        let proposal = HandoffProposal {
+            source_id: SessionId("source".into()),
+            target_id: SessionId("target".into()),
+            source_title: "Source".into(),
+            target_title: "Target".into(),
+            summary: "cached summary".into(),
+        };
+        assert_eq!(handoff_command(&LauncherMode::NewSession, "edited"), None);
+        assert_eq!(
+            handoff_command(&LauncherMode::Handoff(proposal), "  edited summary  "),
+            Some(SendTextCommand {
+                session_id: SessionId("target".into()),
+                text: "edited summary".into(),
+                submit: true,
+            })
+        );
+    }
+
+    #[test]
+    fn handoff_delivery_accepts_one_send_and_ignores_stale_completions() {
+        let mut delivery = HandoffDeliveryState::default();
+        let first = delivery.begin().expect("first send");
+        assert!(delivery.is_sending());
+        assert_eq!(delivery.begin(), None, "double submit must be refused");
+
+        delivery.invalidate();
+        let replacement = delivery.begin().expect("replacement proposal send");
+        assert_ne!(first, replacement);
+        assert!(
+            !delivery.settle(first),
+            "an old RPC must not close a replacement composer"
+        );
+        assert!(delivery.is_sending());
+        assert!(delivery.settle(replacement));
+        assert!(!delivery.is_sending());
     }
 }

@@ -70,6 +70,32 @@ pub struct InjectionConfig {
     pub cli_path: PathBuf,
 }
 
+/// Whether a local session's execution directory is inside `target`.
+///
+/// Session cwd values intentionally preserve the spelling supplied at spawn,
+/// so raw equality misses symlink aliases and sessions started below the
+/// checkout root. Canonicalize when possible and retain a lexical fallback
+/// for a live process whose cwd was unlinked after it started.
+fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path) -> bool {
+    if record.host.is_some() {
+        return false;
+    }
+    record
+        .worktree_path
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(record.cwd.as_str()))
+        .any(|path| {
+            std::fs::canonicalize(path).map_or_else(
+                |_| {
+                    let path = Path::new(path);
+                    path == target || path.starts_with(target)
+                },
+                |path| path == target || path.starts_with(target),
+            )
+        })
+}
+
 impl ControlServer {
     pub fn new(registry: Arc<Mutex<Registry>>, socket_path: impl Into<PathBuf>) -> Self {
         // Capture the bytes this process actually started from before an app
@@ -653,6 +679,7 @@ impl ControlServer {
             Method::HOST_INITIALIZE => self.host_initialize(params),
             Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
             Method::SESSION_MIGRATE => self.session_migrate(params),
+            Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
@@ -816,6 +843,7 @@ impl ControlServer {
 
         let mut record = new_record(&id, &kind, &cwd);
         record.kind = p.kind.clone();
+        record.originating_prompt = p.initial_prompt.clone();
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
@@ -1062,6 +1090,7 @@ impl ControlServer {
 
         let mut record = new_record(&id, &kind, &captured.cwd);
         record.kind = p.kind.clone();
+        record.originating_prompt = p.initial_prompt.clone();
         record.host = Some(host.id.clone());
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
@@ -1417,6 +1446,81 @@ impl ControlServer {
             transcript_migrated: shuttle.migrated,
             warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         })
+    }
+
+    /// Moves an ended resumable session record to a different checkout of the
+    /// same repository. The app proposes this from cached overview data, but
+    /// confirmation always lands here for authoritative revalidation.
+    fn session_reparent_worktree(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReparentWorktreeParams = decode(params)?;
+        let project_root = std::fs::canonicalize(&p.project_root).map_err(|error| {
+            ControlError::bad_request(format!("project root is unavailable: {error}"))
+        })?;
+        let worktree_path = std::fs::canonicalize(&p.worktree_path).map_err(|error| {
+            ControlError::bad_request(format!("worktree is unavailable: {error}"))
+        })?;
+        let worktrees = crate::git::list_worktrees(&project_root).map_err(|error| {
+            ControlError::bad_request(format!("could not inspect project worktrees: {error}"))
+        })?;
+        let target = worktrees
+            .iter()
+            .find(|entry| Path::new(&entry.path) == worktree_path)
+            .ok_or_else(|| {
+                ControlError::bad_request("the target is not a worktree of this project")
+            })?;
+        let target_path = worktree_path.to_string_lossy().into_owned();
+
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let record = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        if record.host.is_some() {
+            return Err(ControlError::bad_request(
+                "remote sessions cannot move into a local worktree",
+            ));
+        }
+        if !matches!(record.status, diri_proto::SessionStatus::Exited(_)) {
+            return Err(ControlError::bad_request(
+                "stop or archive the session before moving it to another worktree",
+            ));
+        }
+        if record.resumability != diri_proto::Resumability::Resumable {
+            return Err(ControlError::bad_request(
+                "this session cannot resume after moving to another worktree",
+            ));
+        }
+        // Project identity is derived from the exact root Diri persisted. The
+        // canonical path above is only for authoritative git membership: a
+        // symlinked project root must not suddenly hash to a different id.
+        let expected_project = crate::registry::session_project_id(&p.project_root, None);
+        if record.project_id != expected_project {
+            return Err(ControlError::bad_request(
+                "the target belongs to a different project",
+            ));
+        }
+        if local_session_uses_worktree(&record, &worktree_path) {
+            return Err(ControlError::bad_request(
+                "the session is already attached to this worktree",
+            ));
+        }
+        let occupied = registry.records().into_iter().any(|candidate| {
+            candidate.id != record.id
+                && !matches!(candidate.status, diri_proto::SessionStatus::Exited(_))
+                && local_session_uses_worktree(&candidate, &worktree_path)
+        });
+        if occupied {
+            return Err(ControlError::bad_request(
+                "another live session already owns this worktree",
+            ));
+        }
+        let updated = registry
+            .reparent_worktree(&p.session_id.0, target_path, target.branch.clone())
+            .map_err(|error| ControlError::internal(error.to_string()))?;
+        self.publish_updated(&registry, &p.session_id.0);
+        encode(&updated)
     }
 
     /// `host.sync_prefs`: push the local agent preferences to a host so
@@ -2689,6 +2793,7 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         git_branch: None,
         title: kind.to_string(),
         title_source: TitleSource::Placeholder,
+        originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
         status: diri_proto::SessionStatus::Starting,
@@ -3314,6 +3419,7 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,
@@ -3336,6 +3442,51 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
         }
+    }
+
+    fn repository_with_linked_worktree(temp: &Path) -> (PathBuf, PathBuf) {
+        let repo = temp.join("repo");
+        let target = temp.join("feature-checkout");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let git = |arguments: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {arguments:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "root"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/reparent",
+            target.to_str().expect("utf8 target"),
+        ]);
+        (
+            repo.canonicalize().expect("repo"),
+            target.canonicalize().expect("target"),
+        )
+    }
+
+    fn ended_resumable_record(id: &str, repo: &Path) -> diri_proto::SessionRecord {
+        let mut record = test_record(id);
+        record.cwd = repo.to_string_lossy().into_owned();
+        record.project_id = crate::registry::session_project_id(&record.cwd, None);
+        record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        record.resumability = diri_proto::Resumability::Resumable;
+        record
     }
 
     /// Round-trips one request through the dispatcher the way a client would.
@@ -4086,6 +4237,166 @@ mod tests {
                 .iter()
                 .any(|worktree| worktree["branch"] == "feature/x")
         );
+    }
+
+    #[test]
+    fn ended_session_reparents_to_a_confirmed_project_worktree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let record = ended_resumable_record("s_move", &repo);
+        registry.lock().expect("registry").insert_record(record);
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let result = ok_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "s_move",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(result["cwd"], target.to_string_lossy().as_ref());
+        assert_eq!(result["worktreePath"], target.to_string_lossy().as_ref());
+        assert_eq!(result["gitBranch"], "feature/reparent");
+        assert!(temp.path().join("state.json").is_file(), "move is durable");
+        let state: JsonValue = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state.json")).expect("read durable state"),
+        )
+        .expect("decode durable state");
+        let persisted = state["sessions"]
+            .as_array()
+            .and_then(|sessions| sessions.iter().find(|session| session["id"] == "s_move"))
+            .expect("persisted moved session");
+        assert_eq!(persisted["cwd"], target.to_string_lossy().as_ref());
+        assert_eq!(persisted["worktreePath"], target.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn worktree_reparent_revalidates_liveness_without_mutating_the_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let mut record = test_record("s_live");
+        record.cwd = repo.to_string_lossy().into_owned();
+        record.project_id = crate::registry::session_project_id(&record.cwd, None);
+        record.resumability = diri_proto::Resumability::Resumable;
+        registry.lock().expect("registry").insert_record(record);
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let error = err_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "s_live",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(error.code, "bad_request");
+        let record = registry
+            .lock()
+            .expect("registry")
+            .record("s_live")
+            .expect("record");
+        assert_eq!(record.cwd, repo.to_string_lossy());
+        assert_eq!(record.worktree_path, None);
+    }
+
+    #[test]
+    fn worktree_reparent_refuses_unknown_session_inside_symlinked_subdirectory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let nested = target.join("nested");
+        std::fs::create_dir(&nested).expect("nested");
+        let alias = temp.path().join("target-alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("symlink");
+
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let source = ended_resumable_record("source", &repo);
+        let mut occupant = test_record("occupant");
+        occupant.cwd = alias.join("nested").to_string_lossy().into_owned();
+        occupant.status = diri_proto::SessionStatus::Unknown;
+        let original_cwd = source.cwd.clone();
+        {
+            let mut registry = registry.lock().expect("registry");
+            registry.insert_record(source);
+            registry.insert_record(occupant);
+        }
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let error = err_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "source",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(error.code, "bad_request");
+        assert!(error.message.contains("owns this worktree"));
+        let source = registry
+            .lock()
+            .expect("registry")
+            .record("source")
+            .expect("source");
+        assert_eq!(source.cwd, original_cwd);
+        assert_eq!(source.worktree_path, None);
+    }
+
+    #[test]
+    fn remote_session_with_same_path_does_not_occupy_a_local_worktree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let source = ended_resumable_record("source", &repo);
+        let mut remote = test_record("remote");
+        remote.cwd = target.to_string_lossy().into_owned();
+        remote.host = Some("forge".into());
+        remote.status = diri_proto::SessionStatus::Working;
+        {
+            let mut registry = registry.lock().expect("registry");
+            registry.insert_record(source);
+            registry.insert_record(remote);
+        }
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let result = ok_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "source",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(result["cwd"], target.to_string_lossy().as_ref());
     }
 
     #[test]

@@ -13,8 +13,8 @@ use gpui::{
 use crate::AppServices;
 use crate::commands::{
     self, APP_CONTEXT, ArchiveSelectedSession, CheckForUpdates, CloseSession, CommandId,
-    FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp, NewCodexSession,
-    NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
+    DelegateSelectedSession, FocusSidebar, MoveSelectedSessionDown, MoveSelectedSessionUp,
+    NewCodexSession, NewDefaultSession, NewTerminal, OpenLauncher, OpenSettings, OpenWorktrees,
     RenameSelectedSession, ReopenSession, SESSION_NAVIGATION_CONTEXT, SelectLastSession,
     SelectNextAttentionSession, SelectNextSession, SelectPreviousSession, SelectSession1,
     SelectSession2, SelectSession3, SelectSession4, SelectSession5, SelectSession6, SelectSession7,
@@ -224,6 +224,11 @@ impl RootView {
             .detach();
         }
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+            if let SidebarEvent::HandoffProposed(proposal) = event {
+                this.launcher.update(cx, |launcher, cx| {
+                    launcher.open_handoff(proposal.clone(), window, cx);
+                });
+            }
             if let SidebarEvent::ExternalDrop(plan) = event
                 && let Some(action) = &plan.action
             {
@@ -774,6 +779,14 @@ impl RootView {
             CommandId::RenameSelectedSession => {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.rename_selected(window, cx));
+            }
+            CommandId::DelegateSelectedSession => {
+                let handled = self
+                    .sidebar
+                    .update(cx, |sidebar, cx| sidebar.mark_or_delegate_selected(cx));
+                if !handled {
+                    cx.propagate();
+                }
             }
             CommandId::SelectNextAttentionSession => {
                 self.sidebar
@@ -2147,6 +2160,11 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &RenameSelectedSession, window, cx| {
                 this.run_command(CommandId::RenameSelectedSession, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &DelegateSelectedSession, window, cx| {
+                    this.run_command(CommandId::DelegateSelectedSession, window, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &SelectNextAttentionSession, window, cx| {
                     this.run_command(CommandId::SelectNextAttentionSession, window, cx);
