@@ -17,8 +17,9 @@ use diri_ui::{
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, MouseButton, Pixels, Point, Render, Rgba, Role, ScrollHandle, SharedString, Task,
-    Window, anchored, deferred, div, linear_color_stop, linear_gradient, point, prelude::*, px,
+    IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
+    SharedString, Task, Window, anchored, deferred, div, linear_color_stop, linear_gradient, point,
+    prelude::*, px,
 };
 use tokio::sync::mpsc;
 
@@ -158,6 +159,16 @@ pub struct Sidebar {
     /// drops. It remains until dismissed or replaced by the next drop so an
     /// error can never disappear between mouse-up and the next frame.
     external_drop_feedback: Option<String>,
+}
+
+/// The sidebar state that asked for a native folder pick, captured when the
+/// panel opens so a completion arriving after the user moved on can be
+/// dropped. The panel is modeless, so "moved on" is anything from dismissing
+/// New Agent to reopening it somewhere else.
+#[derive(Clone, Debug, PartialEq)]
+struct BrowseRequest {
+    popover: Option<Popover>,
+    directory_picker_open: bool,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -382,6 +393,70 @@ impl Sidebar {
 
     pub fn show_new_agent(&mut self, cx: &mut Context<Self>) {
         self.open_new_agent_popover(None, cx);
+    }
+
+    fn browse_local_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Start Here".into()),
+        });
+        // The panel is modeless: the sidebar stays live while it is up, so
+        // pin the popover that asked for the pick. Every "never mind" gesture
+        // (click-out, Escape, ⌘B) and every retarget rewrites this state, and
+        // a completion that no longer matches is dropped instead of
+        // resurrecting a dismissed popover or overwriting a newer target.
+        let requested_by = BrowseRequest {
+            popover: self.ui.popover.clone(),
+            directory_picker_open: self.directory_picker_open,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.pop() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, _window, cx| {
+                this.apply_browsed_local_folder(&requested_by, path.to_string_lossy().into_owned());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// NSOpenPanel paths are This Mac only. Ignore the pick unless the New
+    /// Agent popover that opened the panel is still the one on screen and
+    /// still targets this machine.
+    fn apply_browsed_local_folder(&mut self, requested_by: &BrowseRequest, path: String) {
+        if self.directory_picker_open != requested_by.directory_picker_open
+            || self.ui.popover != requested_by.popover
+        {
+            return;
+        }
+        let Some(Popover::NewAgent { host, .. }) = &self.ui.popover else {
+            return;
+        };
+        // Resolve the host the way the render pass does. A host id that no
+        // longer exists already behaves as This Mac everywhere else — local
+        // fallback target, local label, local spawn — so its pick must land
+        // rather than fall through as a remote target and vanish silently.
+        let targets_a_remote_host = host.as_deref().is_some_and(|id| {
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .host(id)
+                .is_some()
+        });
+        if targets_a_remote_host {
+            return;
+        }
+        self.directory_picker_open = false;
+        self.ui.popover = Some(Popover::NewAgent {
+            directory: Some(path),
+            host: None,
+        });
     }
 
     /// Opens the new-agent picker, refreshing the host catalog first so
@@ -2691,7 +2766,33 @@ impl Sidebar {
                             .request_directory_listing(browse_host.clone(), browse_target.clone());
                         cx.notify();
                     }))
-            });
+            })
+            .when(
+                selected_host.is_none() && self.directory_picker_open,
+                |header| {
+                    header.child(
+                        div()
+                            .id("new-agent-browse")
+                            .debug_selector(|| "new-agent-browse".into())
+                            .px(px(4.0))
+                            .py(px(3.0))
+                            .ml(px(-4.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .rounded(px(Radius::CHIP))
+                            .cursor_pointer()
+                            .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.secondary)
+                            .child(sf_symbol("plus", 11.0, colors.secondary))
+                            .child("Browse…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.browse_local_folder(window, cx);
+                            })),
+                    )
+                },
+            );
         if let Some(subtitle) = subtitle {
             // Repo-resolution state: "locating repo…" or the visible fallback
             // ("anara not on Forge — opens in code").
@@ -5171,7 +5272,7 @@ fn compact_duration(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Modifiers, TestAppContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
     use super::*;
 
@@ -5693,6 +5794,241 @@ mod tests {
         );
         assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
         assert!(cx.debug_bounds("AGENT_OPTION_1").is_some());
+    }
+
+    #[gpui::test]
+    fn new_agent_browse_is_hidden_until_the_folder_browser_opens(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
+        assert!(cx.debug_bounds("new-agent-browse").is_none());
+    }
+
+    #[gpui::test]
+    fn new_agent_browse_is_visible_in_the_local_folder_browser(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.directory_picker_open = true;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: Some("/Users/preview".to_owned()),
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("new-agent-browse").is_some());
+        assert!(cx.debug_bounds("AGENT_OPTION_0").is_none());
+    }
+
+    #[gpui::test]
+    fn new_agent_browse_is_hidden_on_a_remote_host(cx: &mut TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar
+                    .store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_hosts(vec![diri_proto::HostEntry {
+                        id: "forge".into(),
+                        name: Some("Forge".into()),
+                        ssh: "you@forge".into(),
+                        default_cwd: None,
+                        node: None,
+                    }]);
+                sidebar.directory_picker_open = true;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: Some("forge".into()),
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+
+        assert!(cx.debug_bounds("new-agent-browse").is_none());
+    }
+
+    /// A sidebar whose New Agent popover is sitting in the local folder
+    /// browser, i.e. the only state that offers "Browse…".
+    fn sidebar_browsing_locally(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Sidebar>, &mut VisualTestContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.directory_picker_open = true;
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: Some("/Users/preview".to_owned()),
+                    host: None,
+                });
+                sidebar
+            });
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        (sidebar, cx)
+    }
+
+    /// What `browse_local_folder` pins when it opens the panel.
+    fn browse_request(sidebar: &Sidebar) -> BrowseRequest {
+        BrowseRequest {
+            popover: sidebar.ui.popover.clone(),
+            directory_picker_open: sidebar.directory_picker_open,
+        }
+    }
+
+    #[gpui::test]
+    fn browsed_folder_applies_only_while_new_agent_is_on_this_mac(cx: &mut TestAppContext) {
+        let (sidebar, cx) = sidebar_browsing_locally(cx);
+
+        sidebar.update(cx, |sidebar, cx| {
+            let request = browse_request(sidebar);
+            sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
+            cx.notify();
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/Users/me/code".to_owned()),
+                host: None,
+            })
+        );
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .set_hosts(vec![diri_proto::HostEntry {
+                    id: "forge".into(),
+                    name: Some("Forge".into()),
+                    ssh: "you@forge".into(),
+                    default_cwd: None,
+                    node: None,
+                }]);
+            sidebar.directory_picker_open = true;
+            sidebar.ui.popover = Some(Popover::NewAgent {
+                directory: Some("/old".to_owned()),
+                host: Some("forge".into()),
+            });
+            let request = browse_request(sidebar);
+            sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
+            cx.notify();
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/old".to_owned()),
+                host: Some("forge".into()),
+            })
+        );
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.ui.popover = Some(Popover::Account);
+            let request = browse_request(sidebar);
+            sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
+            cx.notify();
+        });
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::Account)
+        );
+    }
+
+    /// The panel is modeless, so Escape, ⌘B and a click outside all close the
+    /// popover while it is up. A pick landing afterwards must not bring the
+    /// dismissed popover back.
+    #[gpui::test]
+    fn a_browsed_folder_is_dropped_after_new_agent_is_dismissed(cx: &mut TestAppContext) {
+        let (sidebar, cx) = sidebar_browsing_locally(cx);
+
+        sidebar.update(cx, |sidebar, cx| {
+            let request = browse_request(sidebar);
+            sidebar.ui.popover = None;
+            sidebar.directory_picker_open = false;
+            sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
+            cx.notify();
+        });
+
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            None
+        );
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
+    }
+
+    /// Dismiss the panel's popover, reopen New Agent on a specific folder, and
+    /// the late pick must not overwrite that newer target.
+    #[gpui::test]
+    fn a_browsed_folder_does_not_clobber_a_newer_new_agent_target(cx: &mut TestAppContext) {
+        let (sidebar, cx) = sidebar_browsing_locally(cx);
+
+        sidebar.update(cx, |sidebar, cx| {
+            let request = browse_request(sidebar);
+            sidebar.directory_picker_open = false;
+            sidebar.ui.popover = Some(Popover::NewAgent {
+                directory: Some("/Users/me/other-repo".to_owned()),
+                host: None,
+            });
+            sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
+            cx.notify();
+        });
+
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/Users/me/other-repo".to_owned()),
+                host: None,
+            })
+        );
+    }
+
+    /// A host id that hosts.json no longer lists already spawns locally, and
+    /// the header offers "Browse…" for it, so its pick has to land — and to
+    /// normalize the popover back to This Mac.
+    #[gpui::test]
+    fn a_browsed_folder_applies_when_the_popover_host_no_longer_exists(cx: &mut TestAppContext) {
+        let (sidebar, cx) = sidebar_browsing_locally(cx);
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .store
+                .write()
+                .expect("session store lock poisoned")
+                .set_hosts(Vec::new());
+            sidebar.ui.popover = Some(Popover::NewAgent {
+                directory: Some("/Users/preview".to_owned()),
+                host: Some("retired".into()),
+            });
+            let request = browse_request(sidebar);
+            sidebar.apply_browsed_local_folder(&request, "/Users/me/code".into());
+            cx.notify();
+        });
+
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(Popover::NewAgent {
+                directory: Some("/Users/me/code".to_owned()),
+                host: None,
+            })
+        );
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.directory_picker_open));
     }
 
     #[gpui::test]
