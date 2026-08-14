@@ -205,7 +205,6 @@ mod tests {
             projects: vec![group("robite-landing", "robite", Vec::new(), Vec::new())],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
-            fleet_pulse: Default::default(),
         };
         let model = build_inbox(&projection, &std::collections::HashSet::new());
         assert!(model.rows.is_empty());
@@ -229,7 +228,6 @@ mod tests {
             )],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
-            fleet_pulse: Default::default(),
         };
         let collapsed = std::collections::HashSet::from(["robite".to_owned()]);
         let model = build_inbox(&projection, &collapsed);
@@ -277,7 +275,6 @@ mod tests {
             )],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
-            fleet_pulse: Default::default(),
         };
         let model = build_inbox(&projection, &std::collections::HashSet::new());
         let InboxRow::Session(nested) = &model.rows[2] else {
@@ -309,7 +306,6 @@ mod tests {
             )],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
-            fleet_pulse: Default::default(),
         };
         let model = build_inbox(&projection, &std::collections::HashSet::new());
         let InboxRow::Session(row) = &model.rows[1] else {
@@ -350,7 +346,6 @@ mod tests {
             )],
             ordered_sessions: Vec::new(),
             display_order: Vec::new(),
-            fleet_pulse: Default::default(),
         };
         let model = build_inbox(&projection, &std::collections::HashSet::new());
         let InboxRow::Session(row) = &model.rows[1] else {
