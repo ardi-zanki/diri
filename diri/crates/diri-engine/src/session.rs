@@ -182,6 +182,11 @@ const LOG_READ_BUDGET: usize = 512 << 10;
 /// twice within one frame is not two observations worth having.
 const EVAL_INTERVAL: Duration = Duration::from_millis(16);
 
+/// How far ahead of the pump a subscription may start and still be worth
+/// taking. Beyond this the file is followed instead, which costs latency for a
+/// moment rather than churning subscriptions that cannot be read yet.
+const LIVE_HANDOVER_GAP: u64 = 256 << 10;
+
 /// What a session looks like from the outside.
 #[derive(Clone, Debug)]
 pub struct SessionView {
@@ -1783,7 +1788,7 @@ fn wait_for_holder(
     session_id: &str,
     pre_spawn_tail: u64,
 ) -> Result<u64, crate::holder::HolderError> {
-    for _ in 0..250 {
+    for delay in crate::holder::readiness_delays().take(300) {
         if let Ok(stat) = client.stat() {
             return Ok(stat.epoch_offset.unwrap_or(pre_spawn_tail));
         }
@@ -1793,7 +1798,7 @@ fn wait_for_holder(
                 return Ok(pre_spawn_tail);
             }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(delay);
     }
     Err(crate::holder::HolderError::Launch(
         "holder did not become ready".into(),
@@ -2699,6 +2704,9 @@ fn pump_held(
     // and the loop just goes back to reading the file from the offset it had
     // reached.
     let mut live: Option<crate::holder::HolderOutputStream> = None;
+    // Reused across passes: a fresh allocation per pass would charge every
+    // byte of output an allocation it does not need.
+    let mut live_run: Vec<u8> = Vec::new();
     // Where the subscription's first frame sits. The holder is ahead of the
     // log by whatever it has read but not yet written, so the file has to be
     // followed up to this point before a frame can be consumed.
@@ -2717,37 +2725,52 @@ fn pump_held(
         // a drained log keeps the handover to a few frames.
         if live.is_none() && drained {
             if let Ok(Some(stream)) = client.open_output_stream() {
+                // A drained log does not mean the holder is where the log
+                // ends: writes are queued, so it can be megabytes further on.
+                // Subscribing across that distance is the worst case — the
+                // holder fills a queue this loop cannot read until the file
+                // catches up, then drops it for being full, and both ends
+                // repeat. Take the subscription only when the gap is small
+                // enough to close immediately, and otherwise keep tailing and
+                // try again the next time the log runs dry.
                 live_from = stream.start_offset();
-                live = Some(stream);
+                if live_from.saturating_sub(offset) <= LIVE_HANDOVER_GAP {
+                    live = Some(stream);
+                }
             }
             drained = false;
         }
         // Frames only once the file has been followed up to where they begin.
         let streaming = live.is_some() && offset >= live_from;
-        let (start, chunk) = match live.as_mut().filter(|_| streaming) {
-            Some(stream) => match stream.next_run(shared.quiet_tick(), LOG_READ_BUDGET) {
-                // Contiguous by construction, and checked anyway: a frame that
-                // does not start where the last one ended means something
-                // raced, and the log is the authority to fall back on rather
-                // than feed the emulator a gap it cannot detect.
-                Ok(Some((at, frame))) if at == offset => (offset, frame),
-                Ok(Some(_)) => {
-                    live = None;
-                    continue;
+        let from_log;
+        let (start, chunk): (u64, &[u8]) = match live.as_mut().filter(|_| streaming) {
+            Some(stream) => {
+                match stream.next_run_into(shared.quiet_tick(), LOG_READ_BUDGET, &mut live_run) {
+                    // Contiguous by construction, and checked anyway: a run
+                    // that does not start where the last one ended means
+                    // something raced, and the log is the authority to fall
+                    // back on rather than feed the emulator a gap it cannot
+                    // detect.
+                    Ok(Some(at)) if at == offset => (offset, &live_run[..]),
+                    Ok(Some(_)) => {
+                        live = None;
+                        continue;
+                    }
+                    // Quiet: fall through to the timers with nothing to feed.
+                    Ok(None) => (offset, &[][..]),
+                    Err(_) => {
+                        // Dropped for falling behind, or the child is gone.
+                        // The log has every byte; resume from it.
+                        live = None;
+                        continue;
+                    }
                 }
-                // Quiet: fall through to the timers below with nothing to feed.
-                Ok(None) => (offset, Vec::new()),
-                Err(_) => {
-                    // Dropped for falling behind, or the child is gone. The
-                    // log has every byte; resume from it at the same offset.
-                    live = None;
-                    continue;
-                }
-            },
+            }
             None => {
                 let mut log = shared.log.lock().expect("log");
                 log.refresh_from_disk();
-                log.read(offset, LOG_READ_BUDGET)
+                from_log = log.read(offset, LOG_READ_BUDGET);
+                (from_log.0, &from_log.1[..])
             }
         };
         // A full read means the tail is not caught up, so this pass may hold
@@ -2881,23 +2904,37 @@ fn pump_held(
         let honored_from = exit_marker_floor
             .saturating_sub(start)
             .min(chunk.len() as u64) as usize;
-        let mut output = Vec::new();
-        if honored_from > 0 {
-            marker_buffer.extend_from_slice(&chunk[..honored_from]);
-            let (replayed, _stale_exit) = HolderExitMarker::drain(&mut marker_buffer);
-            output.extend_from_slice(&replayed);
-            if start + honored_from as u64 >= exit_marker_floor {
-                marker_buffer.clear(); // an unfinished stale marker ends here
+        // Ordinary output carries no exit marker, and accumulating it only to
+        // be handed the same bytes back costs several copies of everything a
+        // session ever prints. When there is nothing buffered and nothing
+        // marker-shaped in the chunk, it is fed where it lies.
+        let staged;
+        let output: &[u8] = if honored_from == 0
+            && marker_buffer.is_empty()
+            && HolderExitMarker::absent_from(chunk)
+        {
+            chunk
+        } else {
+            let mut assembled = Vec::new();
+            if honored_from > 0 {
+                marker_buffer.extend_from_slice(&chunk[..honored_from]);
+                let (replayed, _stale_exit) = HolderExitMarker::drain(&mut marker_buffer);
+                assembled.extend_from_slice(&replayed);
+                if start + honored_from as u64 >= exit_marker_floor {
+                    marker_buffer.clear(); // an unfinished stale marker ends here
+                }
             }
-        }
-        if honored_from < chunk.len() {
-            marker_buffer.extend_from_slice(&chunk[honored_from..]);
-            let (live, exit) = HolderExitMarker::drain(&mut marker_buffer);
-            output.extend_from_slice(&live);
-            if exit.is_some() {
-                exit_status = exit;
+            if honored_from < chunk.len() {
+                marker_buffer.extend_from_slice(&chunk[honored_from..]);
+                let (live, exit) = HolderExitMarker::drain(&mut marker_buffer);
+                assembled.extend_from_slice(&live);
+                if exit.is_some() {
+                    exit_status = exit;
+                }
             }
-        }
+            staged = assembled;
+            &staged
+        };
 
         if !output.is_empty() {
             checkpoint_dirty_at = Some(Instant::now());
@@ -2913,7 +2950,7 @@ fn pump_held(
             eval_dirty = !evaluate_now;
             let (observation, replies) = {
                 let mut screen = shared.screen.lock().expect("screen");
-                screen.feed(&output);
+                screen.feed(output);
                 let replies = screen.take_replies();
                 let observation = if evaluate_now {
                     last_eval_at = Some(Instant::now());
